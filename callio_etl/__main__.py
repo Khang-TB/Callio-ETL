@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from dotenv import load_dotenv
 
 from .config import PipelineConfig
 from .runner import CallioETLRunner
 
 
 def main() -> None:
+    load_dotenv()
     config = PipelineConfig.from_env()
     runner = CallioETLRunner(config)
 

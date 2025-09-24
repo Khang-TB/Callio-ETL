@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import dotenv
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -27,7 +28,7 @@ class CallioAPIConfig:
         timeout = int(os.getenv("API_TIMEOUT", "90"))
         page_size = int(os.getenv("API_PAGE_SIZE", "500"))
 
-        raw_accounts = os.getenv("CALLIO_ACCOUNTS_JSON")
+        raw_accounts = dotenv.get_key(dotenv.find_dotenv(), "CALLIO_ACCOUNTS_JSON")
         accounts_path = os.getenv("CALLIO_ACCOUNTS_FILE")
 
         if accounts_path:
@@ -39,6 +40,9 @@ class CallioAPIConfig:
                 "CALLIO_ACCOUNTS_JSON or CALLIO_ACCOUNTS_FILE environment variable is required. "
                 "Provide the Callio tenant credentials via the environment (e.g. .env file)."
             )
+
+        if raw_accounts:
+            raw_accounts = raw_accounts.strip("'\"")
 
         try:
             parsed = json.loads(raw_accounts)
