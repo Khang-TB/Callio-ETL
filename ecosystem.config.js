@@ -1,9 +1,12 @@
+const isWindows = process.platform === "win32";
+
 module.exports = {
   apps: [
     {
       name: "callio-etl",
-      script: "callio_etl/__main__.py",
-      interpreter: "python3",
+      script: "callio_etl",
+      interpreter: isWindows ? "python" : "python3",
+      interpreter_args: "-m",
       args: "--mode daemon",
       cwd: __dirname,
       env_file: ".env",
