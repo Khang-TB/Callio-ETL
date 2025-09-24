@@ -230,26 +230,23 @@ class CallioAPI:
         if not token:
             return pd.DataFrame()
 
-        docs: Optional[Sequence[Dict[str, Any]]] = None
-        for endpoint in ("group", "user-group"):
+        endpoint_url = "https://clientapi.phonenet.io/user-group"
+        response = requests.get(
+            endpoint_url,
+            headers={"token": token},
+            timeout=self.config.timeout,
+        )
+        if response.status_code == 401:
+            self.logger.warning("[%s][%s] 401 → refreshing token", tenant, endpoint_url)
+            token = self.get_token(tenant, email, password, force=True)
             response = requests.get(
-                f"{self.config.base_url}/{endpoint}",
+                endpoint_url,
                 headers={"token": token},
                 timeout=self.config.timeout,
             )
-            if response.status_code == 401:
-                self.logger.warning("[%s][%s] 401 → refreshing token", tenant, endpoint)
-                token = self.get_token(tenant, email, password, force=True)
-                response = requests.get(
-                    f"{self.config.base_url}/{endpoint}",
-                    headers={"token": token},
-                    timeout=self.config.timeout,
-                )
-            response.raise_for_status()
-            payload = response.json() or {}
-            docs = payload.get("docs") or payload
-            if isinstance(docs, list):
-                break
+        response.raise_for_status()
+        payload = response.json() or {}
+        docs: Optional[Sequence[Dict[str, Any]]] = payload.get("docs") or payload
         if not isinstance(docs, list):
             docs = []
         return pd.DataFrame(docs)
