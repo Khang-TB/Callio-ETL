@@ -4,6 +4,9 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
+import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, List, Optional
 
@@ -102,33 +105,87 @@ def derive_cf0_string_from_df(df: pd.DataFrame) -> pd.Series:
     if "customFields" not in df.columns:
         return pd.Series([None] * len(df), dtype="string")
 
+    target = "Báo cáo cuộc gọi"
+
+    def _normalize(text: str) -> str:
+        decomposed = unicodedata.normalize("NFD", text)
+        without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+        collapsed = re.sub(r"\s+", " ", without_marks)
+        return collapsed.strip().lower()
+
+    normalized_target = _normalize(target)
+
+    def _score(label: Optional[str]) -> float:
+        if not label:
+            return -1.0
+        normalized_label = _normalize(label)
+        if not normalized_label:
+            return -1.0
+        score = SequenceMatcher(None, normalized_label, normalized_target).ratio()
+        if normalized_target in normalized_label:
+            score += 1.0
+        return score
+
+    def _label_from_item(item: Any) -> Optional[str]:
+        if isinstance(item, dict):
+            for key in (
+                "label",
+                "name",
+                "title",
+                "text",
+                "status",
+                "fieldLabel",
+                "fieldName",
+            ):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+            nested = item.get("field")
+            if isinstance(nested, dict):
+                return _label_from_item(nested)
+        elif isinstance(item, str):
+            return item
+        return None
+
     def pick(value: Any) -> Optional[str]:
         parsed = safe_eval(value)
-        first = None
-        if isinstance(parsed, list) and parsed:
-            first = parsed[0]
-        elif isinstance(parsed, dict):
-            first = parsed
-        if first is None:
+        if isinstance(parsed, list):
+            items = [item for item in parsed if item is not None]
+        elif parsed is None:
+            items = []
+        else:
+            items = [parsed]
+        if not items:
             return None
 
+        best_item: Any = None
+        best_score = -1.0
+        for item in items:
+            score = _score(_label_from_item(item))
+            if score > best_score:
+                best_score = score
+                best_item = item
+
+        if best_item is None:
+            best_item = items[0]
+
         candidate: Any = None
-        if isinstance(first, dict):
+        if isinstance(best_item, dict):
             for key in ("val", "value", "values", "text", "name"):
-                if key in first:
-                    candidate = first[key]
+                if key in best_item:
+                    candidate = best_item[key]
                     break
         else:
-            candidate = first
+            candidate = best_item
 
         values: List[str] = []
         if candidate is None:
             return None
         if isinstance(candidate, list):
-            items: Iterable[Any] = candidate
+            items_to_process: Iterable[Any] = candidate
         else:
-            items = (candidate,)
-        for item in items:
+            items_to_process = (candidate,)
+        for item in items_to_process:
             if isinstance(item, dict):
                 raw = item.get("value") or item.get("name") or item.get("text")
             else:
