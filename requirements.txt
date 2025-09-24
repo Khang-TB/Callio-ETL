@@ -3,3 +3,4 @@ requests
 google-cloud-bigquery
 gspread
 python-dotenv
+pyarrow
