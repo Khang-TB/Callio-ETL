@@ -14,17 +14,14 @@ from .bigquery_service import BigQueryService
 from .checkpoints import CheckpointStore, UpdateLogBuffer
 from .config import PipelineConfig
 from .logging_utils import configure_logging
-from .rank_mapping import read_rank_mapping
 from .utils import (
     compute_row_hash,
     derive_cf0_string_from_df,
     extract_user_group_id,
     extract_user_id,
     extract_user_name,
-    iso_week_key,
     ms_to_iso,
     safe_eval,
-    week_start_vn,
 )
 
 
@@ -50,7 +47,6 @@ class CallioETLRunner:
         self.bq.ensure_table_schema_group()
         self.bq.ensure_table_schema_customer()
         self.bq.ensure_table_schema_customer_staging()
-        self.bq.ensure_table_schema_rank_mapping()
         self.checkpoints.warm()
 
     # ------------------------------------------------------------------
@@ -457,50 +453,6 @@ class CallioETLRunner:
         self.bq.client.delete_table(full_stg, not_found_ok=True)
 
     # ------------------------------------------------------------------
-    # Rank mapping
-    # ------------------------------------------------------------------
-    def run_rank_mapping_weekly(self, weekly_key: str) -> int:
-        df_map = read_rank_mapping(self.config.rank_mapping, self.config.bigquery.service_account_json)
-        if df_map.empty:
-            self.logger.warning("⚠️ rank_mapping empty – skipping")
-            return 0
-
-        self.bq.ensure_table_schema_rank_mapping()
-        df_map = df_map.copy()
-        if "grade" in df_map.columns:
-            df_map["grade"] = df_map["grade"].astype("string").str.upper().str.strip()
-        if "code" in df_map.columns:
-            df_map["code"] = df_map["code"].astype("string").str.upper().str.strip()
-
-        now = datetime.now(timezone.utc)
-        week_start = week_start_vn(now)
-        df_map["week_key"] = weekly_key
-        df_map["week_start"] = week_start
-        df_map["snapshot_at"] = pd.Timestamp.utcnow()
-
-        full_table = self.bq.fqn("rank_mapping")
-        delete_sql = f"DELETE FROM `{full_table}` WHERE week_start = @week_start"
-        job_config = bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("week_start", "DATE", week_start)]
-        )
-        self.bq.execute_query(delete_sql, job_config=job_config)
-
-        wanted = [
-            "code",
-            "grade",
-            "target_day",
-            "target_week",
-            "target_month",
-            "week_key",
-            "week_start",
-            "snapshot_at",
-        ]
-        columns = [column for column in wanted if column in df_map.columns]
-        rows = self.bq.load_append(df_map[columns], "rank_mapping")
-        self.logger.info("[rank_mapping] APPEND rows=%s week=%s", rows, weekly_key)
-        return rows
-
-    # ------------------------------------------------------------------
     # Scheduler helpers
     # ------------------------------------------------------------------
     def next_daily(self, base: datetime, hour_utc: int) -> datetime:
@@ -515,8 +467,7 @@ class CallioETLRunner:
         now: datetime,
         staff_last: Optional[datetime],
         group_last: Optional[datetime],
-        rank_last: Optional[datetime],
-    ) -> Tuple[datetime, datetime, datetime, datetime]:
+    ) -> Tuple[datetime, datetime, datetime]:
         next_customer = now
         next_call = now
         if (staff_last is None or (now - staff_last > timedelta(days=1))) or (
@@ -525,19 +476,14 @@ class CallioETLRunner:
             next_staffgrp = now
         else:
             next_staffgrp = self.next_daily(now, self.config.scheduler.staff_daily_hour)
-        if rank_last is None or (now - rank_last > timedelta(days=1)):
-            next_rank = now
-        else:
-            next_rank = self.next_daily(now, self.config.scheduler.rank_daily_hour)
-        return next_customer, next_call, next_staffgrp, next_rank
+        return next_customer, next_call, next_staffgrp
 
     def run_tick(
         self,
         next_customer: datetime,
         next_call: datetime,
         next_staffgrp: datetime,
-        next_rank: datetime,
-    ) -> Tuple[datetime, datetime, datetime, datetime]:
+    ) -> Tuple[datetime, datetime, datetime]:
         loop_start = datetime.now(timezone.utc)
 
         if loop_start >= next_customer:
@@ -597,21 +543,8 @@ class CallioETLRunner:
             self.snapshot_staff_group()
             next_staffgrp = self.next_daily(loop_start + timedelta(seconds=1), self.config.scheduler.staff_daily_hour)
 
-        if loop_start >= next_rank:
-            try:
-                weekly_key = iso_week_key(loop_start)
-                self.logger.info("▶ Daily rank_mapping → writing weekly key=%s", weekly_key)
-                rows = self.run_rank_mapping_weekly(weekly_key)
-                self.log_buffer.add("ALL", "rank_mapping", rows, None, "REPLACE_PARTITION")
-                self.logger.info(
-                    "[rank_mapping] REPLACE_PARTITION week=%s rows=%s", weekly_key, rows
-                )
-            except Exception:  # pragma: no cover - gspread failure path
-                self.logger.exception("rank_mapping error")
-            next_rank = self.next_daily(loop_start + timedelta(seconds=1), self.config.scheduler.rank_daily_hour)
-
         self.log_buffer.flush()
-        return next_customer, next_call, next_staffgrp, next_rank
+        return next_customer, next_call, next_staffgrp
 
     # ------------------------------------------------------------------
     # Entrypoints
@@ -621,25 +554,20 @@ class CallioETLRunner:
         now = datetime.now(timezone.utc)
         staff_last = self.checkpoints.get_last_run_any("staff")
         group_last = self.checkpoints.get_last_run_any("group")
-        rank_last = self.checkpoints.get_last_run_any("rank_mapping")
-        next_customer, next_call, next_staffgrp, next_rank = self.plan_initial_windows(
-            now, staff_last, group_last, rank_last
-        )
+        next_customer, next_call, next_staffgrp = self.plan_initial_windows(now, staff_last, group_last)
         self.logger.info(
-            "⏱️ Schedule boot | customer/call: now | staff/group: %s | rank: %s",
+            "⏱️ Schedule boot | customer/call: now | staff/group: %s",
             next_staffgrp,
-            next_rank,
         )
 
         while True:
             try:
-                next_customer, next_call, next_staffgrp, next_rank = self.run_tick(
+                next_customer, next_call, next_staffgrp = self.run_tick(
                     next_customer,
                     next_call,
                     next_staffgrp,
-                    next_rank,
                 )
-                next_due = min(next_customer, next_call, next_staffgrp, next_rank)
+                next_due = min(next_customer, next_call, next_staffgrp)
                 wait_seconds = int((next_due - datetime.now(timezone.utc)).total_seconds())
                 wait_seconds = max(1, min(300, wait_seconds))
                 self.logger.info("⏳ Idle %ss — next due @ %s UTC", wait_seconds, next_due.isoformat())
@@ -656,10 +584,7 @@ class CallioETLRunner:
         now = datetime.now(timezone.utc)
         staff_last = self.checkpoints.get_last_run_any("staff")
         group_last = self.checkpoints.get_last_run_any("group")
-        rank_last = self.checkpoints.get_last_run_any("rank_mapping")
-        next_customer, next_call, next_staffgrp, next_rank = self.plan_initial_windows(
-            now, staff_last, group_last, rank_last
-        )
+        next_customer, next_call, next_staffgrp = self.plan_initial_windows(now, staff_last, group_last)
 
         far_future = now + timedelta(days=365 * 10)
         if job != "all":
@@ -669,7 +594,5 @@ class CallioETLRunner:
                 next_call = far_future
             if job != "staffgroup":
                 next_staffgrp = far_future
-            if job != "rank":
-                next_rank = far_future
 
-        self.run_tick(next_customer, next_call, next_staffgrp, next_rank)
+        self.run_tick(next_customer, next_call, next_staffgrp)
