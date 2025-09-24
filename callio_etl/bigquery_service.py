@@ -1,14 +1,17 @@
 """BigQuery helper abstraction used by the Callio ETL pipeline."""
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 from google.api_core.exceptions import Conflict, NotFound
 from google.cloud import bigquery
+from google.auth import exceptions as auth_exceptions
 from google.oauth2 import service_account
 
 from .config import BigQueryConfig
@@ -22,9 +25,68 @@ class BigQueryService:
 
     def __post_init__(self) -> None:
         info = json.loads(self.config.service_account_json)
+        info = self._ensure_private_key_padding(info)
         project = info.get("project_id") or self.config.project_id
         credentials = service_account.Credentials.from_service_account_info(info)
         self.client = bigquery.Client(project=project, credentials=credentials)
+
+    @staticmethod
+    def _ensure_private_key_padding(info: Dict[str, str]) -> Dict[str, str]:
+        """Normalize the PEM block stored in the service account JSON.
+
+        Some service account exports contain base64 segments whose length is not a
+        multiple of four, which causes ``google-auth`` to raise ``Incorrect
+        padding`` errors when instantiating credentials. We attempt to
+        transparently normalise those keys by decoding the PEM payload using the
+        permissive base64 decoder and then re-encoding it with proper padding.
+        """
+
+        private_key = info.get("private_key")
+        if not private_key:
+            return info
+
+        header = "-----BEGIN PRIVATE KEY-----"
+        footer = "-----END PRIVATE KEY-----"
+
+        lines = [line.strip() for line in private_key.splitlines() if line.strip()]
+        if len(lines) < 3 or lines[0] != header or lines[-1] != footer:
+            return info
+
+        body = "".join(lines[1:-1])
+        try:
+            base64.b64decode(body, validate=True)
+            return info
+        except (binascii.Error, ValueError):
+            pass
+
+        try:
+            key_bytes = base64.b64decode(body, validate=False)
+        except binascii.Error as exc:  # pragma: no cover - defensive guard
+            raise RuntimeError("Invalid private key in service account JSON") from exc
+
+        updated = dict(info)
+        for trim in range(0, min(len(key_bytes), 32)):
+            candidate_bytes = key_bytes[:-trim] if trim else key_bytes
+            normalized = base64.b64encode(candidate_bytes).decode("ascii")
+            wrapped = "\n".join(
+                normalized[i : i + 64] for i in range(0, len(normalized), 64)
+            )
+            updated["private_key"] = f"{header}\n{wrapped}\n{footer}"
+            try:
+                service_account.Credentials.from_service_account_info(updated)
+            except auth_exceptions.GoogleAuthError as exc:
+                if (
+                    trim + 1 < len(key_bytes)
+                    and isinstance(exc.args, tuple)
+                    and exc.args
+                    and exc.args[0] == "Unused bytes"
+                ):
+                    continue
+                raise
+            else:
+                return updated
+
+        raise RuntimeError("Unable to normalise service account private key")
 
     # ------------------------------------------------------------------
     # Dataset helpers
