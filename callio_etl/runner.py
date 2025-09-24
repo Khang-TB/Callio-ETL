@@ -13,7 +13,7 @@ from .api import CallioAPI
 from .bigquery_service import BigQueryService
 from .checkpoints import CheckpointStore, UpdateLogBuffer
 from .config import PipelineConfig
-from .logging_utils import configure_logging
+from .logging_utils import configure_logging, track_progress
 from .utils import (
     compute_row_hash,
     derive_cf0_string_from_df,
@@ -323,7 +323,11 @@ class CallioETLRunner:
 
     def snapshot_staff_group(self) -> None:
         staff_all = []
-        for account in self.config.api.accounts:
+        for account in track_progress(
+            self.config.api.accounts,
+            "[staff] fetching tenants",
+            transient=False,
+        ):
             token = self.api.get_token(account.tenant, account.email, account.password)
             if not token:
                 self.log_buffer.add(account.tenant, "staff", 0, None, "ERROR_LOGIN")
@@ -356,7 +360,11 @@ class CallioETLRunner:
             self.logger.info("[staff] NOOP (no rows)")
 
         group_all = []
-        for account in self.config.api.accounts:
+        for account in track_progress(
+            self.config.api.accounts,
+            "[group] fetching tenants",
+            transient=False,
+        ):
             token = self.api.get_token(account.tenant, account.email, account.password)
             if not token:
                 self.log_buffer.add(account.tenant, "group", 0, None, "ERROR_LOGIN")
@@ -490,7 +498,11 @@ class CallioETLRunner:
             self.logger.info("▶ Run customer (all tenants) | interval=%sm", self.config.scheduler.customer_interval_minutes)
             window_min, window_max = None, None
             staged_stats: Dict[str, Dict[str, Optional[int]]] = {}
-            for account in self.config.api.accounts:
+            for account in track_progress(
+                self.config.api.accounts,
+                "[customer] syncing tenants",
+                transient=False,
+            ):
                 token = self.api.get_token(account.tenant, account.email, account.password)
                 if not token:
                     self.log_buffer.add(account.tenant, "customer", 0, None, "ERROR_LOGIN")
@@ -526,7 +538,11 @@ class CallioETLRunner:
 
         if loop_start >= next_call:
             self.logger.info("▶ Run call_log (all tenants) | interval=%sm", self.config.scheduler.call_interval_minutes)
-            for account in self.config.api.accounts:
+            for account in track_progress(
+                self.config.api.accounts,
+                "[call_log] syncing tenants",
+                transient=False,
+            ):
                 token = self.api.get_token(account.tenant, account.email, account.password)
                 if not token:
                     ck = self.checkpoints.get_checkpoint("call_log", account.tenant)

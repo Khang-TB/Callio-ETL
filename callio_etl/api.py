@@ -9,6 +9,7 @@ import pandas as pd
 import requests
 
 from .config import CallioAPIConfig
+from .logging_utils import progress_task
 from .utils import ms_to_iso, pct, safe_eval
 
 
@@ -99,68 +100,89 @@ class CallioAPI:
         window_end_ms = int(time.time() * 1000)
         denom = max(1, window_end_ms - int(cutoff_ms or 0))
 
-        while True:
-            params = {"page": page, "pageSize": self.config.page_size, "sort": f"{time_field}DESC"}
-            response = requests.get(
-                f"{self.config.base_url}/{endpoint}",
-                headers=headers,
-                params=params,
-                timeout=self.config.timeout,
-            )
-            if response.status_code == 401:
-                self.logger.warning("%s 401 on page=%s → refreshing token", log_prefix, page)
-                token = self.get_token(tenant, email, password, force=True)
-                if not token:
-                    raise RuntimeError(f"[{tenant}] token refresh failed")
-                headers = {"token": token}
+        progress_label = log_prefix or f"[{tenant}][{endpoint}]"
+        with progress_task(f"{progress_label} fetching", transient=False) as (bar, task_id):
+            while True:
+                params = {"page": page, "pageSize": self.config.page_size, "sort": f"{time_field}DESC"}
                 response = requests.get(
                     f"{self.config.base_url}/{endpoint}",
                     headers=headers,
                     params=params,
                     timeout=self.config.timeout,
                 )
+                if response.status_code == 401:
+                    self.logger.warning("%s 401 on page=%s → refreshing token", log_prefix, page)
+                    token = self.get_token(tenant, email, password, force=True)
+                    if not token:
+                        raise RuntimeError(f"[{tenant}] token refresh failed")
+                    headers = {"token": token}
+                    response = requests.get(
+                        f"{self.config.base_url}/{endpoint}",
+                        headers=headers,
+                        params=params,
+                        timeout=self.config.timeout,
+                    )
 
-            response.raise_for_status()
-            payload = response.json() or {}
-            docs = payload.get("docs") or []
-            total_docs = payload.get("totalDocs") or payload.get("total")
-            has_next = bool(payload.get("hasNextPage", False))
-            count_this_page = 0
-            stop_flag = False
+                response.raise_for_status()
+                payload = response.json() or {}
+                docs = payload.get("docs") or []
+                total_docs = payload.get("totalDocs") or payload.get("total")
+                has_next = bool(payload.get("hasNextPage", False))
+                count_this_page = 0
+                stop_flag = False
 
-            for doc in docs:
-                timestamp = int(doc.get(time_field) or 0)
-                if timestamp <= cutoff_ms:
-                    stop_flag = True
+                for doc in docs:
+                    timestamp = int(doc.get(time_field) or 0)
+                    if timestamp <= cutoff_ms:
+                        stop_flag = True
+                        break
+                    all_docs.append(doc)
+                    count_this_page += 1
+
+                last_ts = int(all_docs[-1].get(time_field)) if all_docs else None
+                coverage = (window_end_ms - (last_ts or window_end_ms)) / denom if denom > 0 else 0.0
+
+                if total_docs:
+                    try:
+                        total_value = int(total_docs)
+                    except (TypeError, ValueError):
+                        total_value = None
+                    else:
+                        bar.update(task_id, total=total_value)
+
+                bar.update(
+                    task_id,
+                    advance=count_this_page,
+                    description=(
+                        f"{progress_label} page={page} loaded={len(all_docs)} coverage={pct(coverage)}"
+                    ),
+                )
+
+                self.logger.info(
+                    "%s page=%s got=%s cum=%s last_ts=%s window=[%s → %s] time_coverage≈%s totalDocs=%s hasNext=%s",
+                    log_prefix,
+                    page,
+                    count_this_page,
+                    len(all_docs),
+                    ms_to_iso(last_ts),
+                    ms_to_iso(cutoff_ms),
+                    ms_to_iso(window_end_ms),
+                    pct(coverage),
+                    total_docs,
+                    has_next and not stop_flag,
+                )
+
+                if limit_records and len(all_docs) >= limit_records:
+                    all_docs = all_docs[:limit_records]
+                    self.logger.info("%s hit LIMIT_RECORDS_PER_ENDPOINT=%s", log_prefix, limit_records)
                     break
-                all_docs.append(doc)
-                count_this_page += 1
 
-            last_ts = int(all_docs[-1].get(time_field)) if all_docs else None
-            progress = (window_end_ms - (last_ts or window_end_ms)) / denom if denom > 0 else 0.0
-            self.logger.info(
-                "%s page=%s got=%s cum=%s last_ts=%s window=[%s → %s] time_coverage≈%s totalDocs=%s hasNext=%s",
-                log_prefix,
-                page,
-                count_this_page,
-                len(all_docs),
-                ms_to_iso(last_ts),
-                ms_to_iso(cutoff_ms),
-                ms_to_iso(window_end_ms),
-                pct(progress),
-                total_docs,
-                has_next and not stop_flag,
-            )
+                if stop_flag or not has_next:
+                    break
 
-            if limit_records and len(all_docs) >= limit_records:
-                all_docs = all_docs[:limit_records]
-                self.logger.info("%s hit LIMIT_RECORDS_PER_ENDPOINT=%s", log_prefix, limit_records)
-                break
+                page += 1
 
-            if stop_flag or not has_next:
-                break
-
-            page += 1
+            bar.update(task_id, description=f"{progress_label} done")
 
         self.logger.info(
             "%s DONE pages=%s loaded=%s range=[%s → %s]",

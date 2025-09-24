@@ -4,4 +4,5 @@ google-cloud-bigquery
 gspread
 python-dotenv
 pyarrow
+rich
 pandas-gbq
