@@ -118,31 +118,6 @@ class BigQueryService:
             self.client.create_table(table)
             self.logger.info("✅ Created table %s", table_id)
 
-    def ensure_table_schema_rank_mapping(self) -> None:
-        table_id = self.fqn("rank_mapping")
-        try:
-            self.client.get_table(table_id)
-            return
-        except NotFound:
-            schema = [
-                bigquery.SchemaField("code", "STRING"),
-                bigquery.SchemaField("grade", "STRING"),
-                bigquery.SchemaField("target_day", "INT64"),
-                bigquery.SchemaField("target_week", "INT64"),
-                bigquery.SchemaField("target_month", "INT64"),
-                bigquery.SchemaField("week_key", "STRING"),
-                bigquery.SchemaField("week_start", "DATE"),
-                bigquery.SchemaField("snapshot_at", "TIMESTAMP"),
-            ]
-            table = bigquery.Table(table_id, schema=schema)
-            table.clustering_fields = ["code"]
-            table.time_partitioning = bigquery.TimePartitioning(
-                type_=bigquery.TimePartitioningType.DAY,
-                field="week_start",
-            )
-            self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
-
     def ensure_table_schema_customer(self) -> None:
         table_id = self.fqn("customer")
         try:

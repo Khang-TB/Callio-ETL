@@ -28,14 +28,31 @@ class CallioAPIConfig:
         page_size = int(os.getenv("API_PAGE_SIZE", "500"))
 
         raw_accounts = os.getenv("CALLIO_ACCOUNTS_JSON")
-        if raw_accounts:
-            account_dicts = json.loads(raw_accounts)
-        else:
-            account_dicts = [
-                {"tenant": "hot1new", "email": "hot1new@gmail.com", "password": "Huyhoang@123"},
-                {"tenant": "hot1old", "email": "hot1old@gmail.com", "password": "Huyhoang@123"},
-                {"tenant": "hot2", "email": "hot2@gmail.com", "password": "Huyhoang@123"},
-            ]
+        accounts_path = os.getenv("CALLIO_ACCOUNTS_FILE")
+
+        if accounts_path:
+            with open(accounts_path, "r", encoding="utf-8") as handle:
+                raw_accounts = handle.read()
+
+        if not raw_accounts:
+            raise RuntimeError(
+                "CALLIO_ACCOUNTS_JSON or CALLIO_ACCOUNTS_FILE environment variable is required. "
+                "Provide the Callio tenant credentials via the environment (e.g. .env file)."
+            )
+
+        try:
+            parsed = json.loads(raw_accounts)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("CALLIO accounts JSON is invalid") from exc
+
+        if not isinstance(parsed, (list, tuple)):
+            raise RuntimeError("CALLIO accounts JSON must be a list of account objects")
+
+        account_dicts = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise RuntimeError("Each Callio account entry must be an object with tenant/email/password")
+            account_dicts.append(item)
 
         accounts = tuple(Account(**item) for item in account_dicts)
         return cls(base_url=base_url, timeout=timeout, page_size=page_size, accounts=accounts)
@@ -54,10 +71,16 @@ class BigQueryConfig:
     @classmethod
     def from_env(cls) -> "BigQueryConfig":
         service_account_json = os.getenv("SERVICE_ACCOUNT_KEY_JSON")
+        service_account_path = os.getenv("SERVICE_ACCOUNT_KEY_FILE")
+
+        if service_account_path:
+            with open(service_account_path, "r", encoding="utf-8") as handle:
+                service_account_json = handle.read()
+
         if not service_account_json:
             raise RuntimeError(
-                "SERVICE_ACCOUNT_KEY_JSON environment variable is required. "
-                "Provide the JSON credentials (or a path) before running."
+                "SERVICE_ACCOUNT_KEY_JSON or SERVICE_ACCOUNT_KEY_FILE environment variable is required. "
+                "Provide the BigQuery credentials via the environment (e.g. .env file)."
             )
 
         project_id = os.getenv("BQ_PROJECT_ID", "rio-system-migration")
@@ -72,25 +95,10 @@ class BigQueryConfig:
 
 
 @dataclass(frozen=True)
-class RankMappingConfig:
-    sheet_id: str
-    tab_name: str
-    ranges: Tuple[str, ...]
-
-    @classmethod
-    def from_env(cls) -> "RankMappingConfig":
-        sheet_id = os.getenv("RANK_SHEET_ID", "1U8B9tglIj21GRbC-TJfB549hx7xE-kP6X99ls-Ihsho")
-        tab_name = os.getenv("RANK_TAB_NAME", "XẾP HẠNG HIỆN TẠI")
-        ranges = tuple(r.strip() for r in os.getenv("RANK_RANGES_A1", "A1:Q").split(";") if r.strip())
-        return cls(sheet_id=sheet_id, tab_name=tab_name, ranges=ranges)
-
-
-@dataclass(frozen=True)
 class SchedulerConfig:
     customer_interval_minutes: int = 15
     call_interval_minutes: int = 15
     staff_daily_hour: int = 9
-    rank_daily_hour: int = 9
 
 
 @dataclass(frozen=True)
@@ -109,7 +117,6 @@ class WindowConfig:
 class PipelineConfig:
     api: CallioAPIConfig
     bigquery: BigQueryConfig
-    rank_mapping: RankMappingConfig
     scheduler: SchedulerConfig
     window: WindowConfig
     log_level: str
@@ -123,7 +130,6 @@ class PipelineConfig:
         return cls(
             api=CallioAPIConfig.from_env(),
             bigquery=BigQueryConfig.from_env(),
-            rank_mapping=RankMappingConfig.from_env(),
             scheduler=SchedulerConfig(),
             window=WindowConfig.from_env(),
             log_level=log_level,

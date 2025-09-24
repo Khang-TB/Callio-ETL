@@ -20,7 +20,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--job",
-        choices=["all", "customer", "call", "staffgroup", "rank"],
+        choices=["all", "customer", "call", "staffgroup"],
         default="all",
         help="Job to run when --mode=once",
     )
