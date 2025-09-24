@@ -43,6 +43,8 @@ class UpdateLogBuffer:
             return
         self.bq.ensure_update_log()
         df = pd.DataFrame([entry.__dict__ for entry in self._pending])
+        if "max_update_time" in df.columns:
+            df = df.rename(columns={"max_update_time": "max_updateTime"})
         self.bq.load_append(df, "update_log")
         self.logger.info("📝 Flushed update_log: %d rows", len(self._pending))
         self._pending.clear()
