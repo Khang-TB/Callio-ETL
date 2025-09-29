@@ -105,52 +105,14 @@ def derive_cf0_string_from_df(df: pd.DataFrame) -> pd.Series:
     if "customFields" not in df.columns:
         return pd.Series([None] * len(df), dtype="string")
 
-    target = "Báo cáo cuộc gọi"
-
-    def _normalize(text: str) -> str:
-        decomposed = unicodedata.normalize("NFD", text)
-        without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
-        collapsed = re.sub(r"\s+", " ", without_marks)
-        return collapsed.strip().lower()
-
-    normalized_target = _normalize(target)
-
-    def _score(label: Optional[str]) -> float:
-        if not label:
-            return -1.0
-        normalized_label = _normalize(label)
-        if not normalized_label:
-            return -1.0
-        score = SequenceMatcher(None, normalized_label, normalized_target).ratio()
-        if normalized_target in normalized_label:
-            score += 1.0
-        return score
-
-    def _label_from_item(item: Any) -> Optional[str]:
-        if isinstance(item, dict):
-            for key in (
-                "label",
-                "name",
-                "title",
-                "text",
-                "status",
-                "fieldLabel",
-                "fieldName",
-            ):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value
-            nested = item.get("field")
-            if isinstance(nested, dict):
-                return _label_from_item(nested)
-        elif isinstance(item, str):
-            return item
-        return None
+    target_key = "tinh-trang-kh"
 
     def pick(value: Any) -> Optional[str]:
         parsed = safe_eval(value)
         if isinstance(parsed, list):
-            items = [item for item in parsed if item is not None]
+            items = parsed
+        elif isinstance(parsed, dict):
+            items = [parsed]
         elif parsed is None:
             items = []
         else:
@@ -158,53 +120,37 @@ def derive_cf0_string_from_df(df: pd.DataFrame) -> pd.Series:
         if not items:
             return None
 
-        best_item: Any = None
-        best_score = -1.0
+        match: Optional[dict] = None
         for item in items:
-            score = _score(_label_from_item(item))
-            if score > best_score:
-                best_score = score
-                best_item = item
-
-        if best_item is None:
-            best_item = items[0]
-
-        candidate: Any = None
-        if isinstance(best_item, dict):
-            for key in ("val", "value", "values", "text", "name"):
-                if key in best_item:
-                    candidate = best_item[key]
-                    break
-        else:
-            candidate = best_item
-
-        values: List[str] = []
-        if candidate is None:
-            return None
-        if isinstance(candidate, list):
-            items_to_process: Iterable[Any] = candidate
-        else:
-            items_to_process = (candidate,)
-        for item in items_to_process:
-            if isinstance(item, dict):
-                raw = item.get("value") or item.get("name") or item.get("text")
-            else:
-                raw = item
-            if raw is None:
+            if not isinstance(item, dict):
                 continue
-            text = str(raw).strip()
-            if text and text.lower() != "nan":
-                values.append(text)
+            key = str(item.get("key") or "").strip().lower()
+            if key == target_key:
+                match = item
+                break
+        if match is None:
+            return None
+
+        raw = match.get("val") or match.get("value") or match.get("values") or match.get("text") or match.get("name")
+        if raw is None:
+            return None
+
+        if isinstance(raw, list):
+            values = [str(elem).strip() for elem in raw if elem is not None and str(elem).strip()]
+        else:
+            candidate = str(raw).strip()
+            values = [candidate] if candidate else []
         if not values:
             return None
-        seen: set[str] = set()
+
         unique: List[str] = []
-        for value in values:
-            if value in seen:
+        seen: set[str] = set()
+        for val in values:
+            if val in seen:
                 continue
-            seen.add(value)
-            unique.append(value)
-        return " | ".join(unique)
+            seen.add(val)
+            unique.append(val)
+        return " | ".join(unique) if unique else None
 
     return df["customFields"].apply(pick).astype("string")
 
