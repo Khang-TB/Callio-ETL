@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from datetime import datetime, timedelta, timezone, time as dt_time
+from typing import Dict, Optional, Sequence, Tuple
 
 import pandas as pd
 from google.cloud import bigquery
@@ -491,12 +491,95 @@ class CallioETLRunner:
     # ------------------------------------------------------------------
     # Scheduler helpers
     # ------------------------------------------------------------------
-    def next_daily(self, base: datetime, hour_utc: int) -> datetime:
-        x = base.replace(minute=0, second=0, microsecond=0)
-        target = x.replace(hour=hour_utc)
-        if target <= base:
-            target += timedelta(days=1)
-        return target
+    def _format_times(self, schedule: Sequence[dt_time]) -> str:
+        return ", ".join(t.strftime("%H:%M") for t in sorted(schedule))
+
+    def _next_scheduled(self, base: datetime, schedule: Sequence[dt_time]) -> datetime:
+        if not schedule:
+            raise ValueError("Schedule cannot be empty")
+        sorted_times = sorted(schedule)
+        day = base.astimezone(timezone.utc).date()
+        for point in sorted_times:
+            candidate = datetime.combine(day, point)
+            if candidate > base:
+                return candidate
+        next_day = day + timedelta(days=1)
+        return datetime.combine(next_day, sorted_times[0])
+
+    def _previous_or_current_scheduled(self, base: datetime, schedule: Sequence[dt_time]) -> datetime:
+        if not schedule:
+            raise ValueError("Schedule cannot be empty")
+        sorted_times = sorted(schedule)
+        day = base.astimezone(timezone.utc).date()
+        for point in reversed(sorted_times):
+            candidate = datetime.combine(day, point)
+            if candidate <= base:
+                return candidate
+        prev_day = day - timedelta(days=1)
+        return datetime.combine(prev_day, sorted_times[-1])
+
+    def _run_customer_all_tenants(self, schedule_label: str) -> None:
+        self.logger.info("Run customer (all tenants) | schedule=%s UTC", schedule_label)
+        window_min: Optional[datetime.date]
+        window_max: Optional[datetime.date]
+        window_min, window_max = None, None
+        staged_stats: Dict[str, Dict[str, Optional[int]]] = {}
+        for account in track_progress(
+            self.config.api.accounts,
+            "[customer] syncing tenants",
+            transient=False,
+        ):
+            token = self.api.get_token(account.tenant, account.email, account.password)
+            if not token:
+                self.log_buffer.add(account.tenant, "customer", 0, None, "ERROR_LOGIN")
+                continue
+            try:
+                (d_from, d_to), rows, max_update = self.run_customer_for_tenant(account.tenant)
+                if d_from and d_to:
+                    window_min = d_from if (window_min is None or d_from < window_min) else window_min
+                    window_max = d_to if (window_max is None or d_to > window_max) else window_max
+                staged_stats[account.tenant] = {"rows": rows, "max_update": max_update}
+            except Exception:  # pragma: no cover - network failure path
+                self.logger.exception("[%s] customer error", account.tenant)
+
+        if window_min and window_max:
+            try:
+                self.merge_customer_window(window_min, window_max)
+                for tenant, stats in staged_stats.items():
+                    max_update = stats.get("max_update")
+                    if max_update is not None:
+                        self.checkpoints.set_checkpoint("customer", tenant, max_update)
+                        self.log_buffer.add(tenant, "customer", stats.get("rows", 0), max_update, "MERGED")
+                        self.logger.info(
+                            "[%s][customer] MERGED window [%s..%s] -> CK=%s",
+                            tenant,
+                            window_min,
+                            window_max,
+                            ms_to_iso(max_update),
+                        )
+            except Exception:  # pragma: no cover - BQ failure path
+                self.logger.exception("MERGE customer window [%s..%s] failed", window_min, window_max)
+
+    def _run_call_all_tenants(self, schedule_label: str) -> None:
+        self.logger.info("Run call_log (all tenants) | schedule=%s UTC", schedule_label)
+        for account in track_progress(
+            self.config.api.accounts,
+            "[call_log] syncing tenants",
+            transient=False,
+        ):
+            token = self.api.get_token(account.tenant, account.email, account.password)
+            if not token:
+                ck = self.checkpoints.get_checkpoint("call_log", account.tenant)
+                self.log_buffer.add(account.tenant, "call_log", 0, ck, "ERROR_LOGIN")
+                continue
+            try:
+                self.run_call_for_tenant(account.tenant)
+            except Exception:  # pragma: no cover - network failure path
+                self.logger.exception("[%s] call_log error", account.tenant)
+
+    def _run_staff_group_snapshot(self, staff_label: str) -> None:
+        self.logger.info("Daily snapshot: staff + group (all tenants) | schedule=%s UTC", staff_label)
+        self.snapshot_staff_group()
 
     def plan_initial_windows(
         self,
@@ -504,14 +587,17 @@ class CallioETLRunner:
         staff_last: Optional[datetime],
         group_last: Optional[datetime],
     ) -> Tuple[datetime, datetime, datetime]:
-        next_customer = now
-        next_call = now
+        schedule = self.config.scheduler.run_times_utc
+        next_customer = self._previous_or_current_scheduled(now, schedule)
+        next_call = self._previous_or_current_scheduled(now, schedule)
+
+        staff_schedule = (self.config.scheduler.staff_group_time_utc,)
         if (staff_last is None or (now - staff_last > timedelta(days=1))) or (
             group_last is None or (now - group_last > timedelta(days=1))
         ):
-            next_staffgrp = now
+            next_staffgrp = self._previous_or_current_scheduled(now, staff_schedule)
         else:
-            next_staffgrp = self.next_daily(now, self.config.scheduler.staff_daily_hour)
+            next_staffgrp = self._next_scheduled(now, staff_schedule)
         return next_customer, next_call, next_staffgrp
 
     def run_tick(
@@ -522,70 +608,22 @@ class CallioETLRunner:
     ) -> Tuple[datetime, datetime, datetime]:
         loop_start = datetime.now(timezone.utc)
 
+        schedule = self.config.scheduler.run_times_utc
+        schedule_label = self._format_times(schedule)
+        staff_schedule = (self.config.scheduler.staff_group_time_utc,)
+        staff_label = self._format_times(staff_schedule)
+
         if loop_start >= next_customer:
-            self.logger.info("Run customer (all tenants) | interval=%sm", self.config.scheduler.customer_interval_minutes)
-            window_min, window_max = None, None
-            staged_stats: Dict[str, Dict[str, Optional[int]]] = {}
-            for account in track_progress(
-                self.config.api.accounts,
-                "[customer] syncing tenants",
-                transient=False,
-            ):
-                token = self.api.get_token(account.tenant, account.email, account.password)
-                if not token:
-                    self.log_buffer.add(account.tenant, "customer", 0, None, "ERROR_LOGIN")
-                    continue
-                try:
-                    (d_from, d_to), rows, max_update = self.run_customer_for_tenant(account.tenant)
-                    if d_from and d_to:
-                        window_min = d_from if (window_min is None or d_from < window_min) else window_min
-                        window_max = d_to if (window_max is None or d_to > window_max) else window_max
-                    staged_stats[account.tenant] = {"rows": rows, "max_update": max_update}
-                except Exception:  # pragma: no cover - network failure path
-                    self.logger.exception("[%s] customer error", account.tenant)
-
-            if window_min and window_max:
-                try:
-                    self.merge_customer_window(window_min, window_max)
-                    for tenant, stats in staged_stats.items():
-                        max_update = stats.get("max_update")
-                        if max_update is not None:
-                            self.checkpoints.set_checkpoint("customer", tenant, max_update)
-                            self.log_buffer.add(tenant, "customer", stats.get("rows", 0), max_update, "MERGED")
-                            self.logger.info(
-                                "[%s][customer] MERGED window [%s..%s] -> CK=%s",
-                                tenant,
-                                window_min,
-                                window_max,
-                                ms_to_iso(max_update),
-                            )
-                except Exception:  # pragma: no cover - BQ failure path
-                    self.logger.exception("MERGE customer window [%s..%s] failed", window_min, window_max)
-
-            next_customer = loop_start + timedelta(minutes=self.config.scheduler.customer_interval_minutes)
+            self._run_customer_all_tenants(schedule_label)
+            next_customer = self._next_scheduled(loop_start, schedule)
 
         if loop_start >= next_call:
-            self.logger.info("Run call_log (all tenants) | interval=%sm", self.config.scheduler.call_interval_minutes)
-            for account in track_progress(
-                self.config.api.accounts,
-                "[call_log] syncing tenants",
-                transient=False,
-            ):
-                token = self.api.get_token(account.tenant, account.email, account.password)
-                if not token:
-                    ck = self.checkpoints.get_checkpoint("call_log", account.tenant)
-                    self.log_buffer.add(account.tenant, "call_log", 0, ck, "ERROR_LOGIN")
-                    continue
-                try:
-                    self.run_call_for_tenant(account.tenant)
-                except Exception:  # pragma: no cover - network failure path
-                    self.logger.exception("[%s] call_log error", account.tenant)
-            next_call = loop_start + timedelta(minutes=self.config.scheduler.call_interval_minutes)
+            self._run_call_all_tenants(schedule_label)
+            next_call = self._next_scheduled(loop_start, schedule)
 
         if loop_start >= next_staffgrp:
-            self.logger.info("Daily snapshot: staff + group (all tenants)")
-            self.snapshot_staff_group()
-            next_staffgrp = self.next_daily(loop_start + timedelta(seconds=1), self.config.scheduler.staff_daily_hour)
+            self._run_staff_group_snapshot(staff_label)
+            next_staffgrp = self._next_scheduled(loop_start + timedelta(seconds=1), staff_schedule)
 
         self.log_buffer.flush()
         return next_customer, next_call, next_staffgrp
@@ -626,17 +664,34 @@ class CallioETLRunner:
     def run_once(self, job: str = "all") -> None:
         self.bootstrap()
         now = datetime.now(timezone.utc)
-        staff_last = self.checkpoints.get_last_run_any("staff")
-        group_last = self.checkpoints.get_last_run_any("group")
-        next_customer, next_call, next_staffgrp = self.plan_initial_windows(now, staff_last, group_last)
+        schedule = self.config.scheduler.run_times_utc
+        schedule_label = self._format_times(schedule)
+        staff_schedule = (self.config.scheduler.staff_group_time_utc,)
+        staff_label = self._format_times(staff_schedule)
 
-        far_future = now + timedelta(days=365 * 10)
-        if job != "all":
-            if job != "customer":
-                next_customer = far_future
-            if job != "call":
-                next_call = far_future
-            if job != "staffgroup":
-                next_staffgrp = far_future
+        jobs = {job} if job != "all" else {"customer", "call", "staffgroup"}
 
-        self.run_tick(next_customer, next_call, next_staffgrp)
+        if "customer" in jobs:
+            self._run_customer_all_tenants(schedule_label)
+
+        if "call" in jobs:
+            self._run_call_all_tenants(schedule_label)
+
+        if "staffgroup" in jobs:
+            current_slot = self._previous_or_current_scheduled(now, staff_schedule)
+            staff_last = self.checkpoints.get_last_run_any("staff")
+            group_last = self.checkpoints.get_last_run_any("group")
+            already_ran = (
+                staff_last is not None
+                and staff_last >= current_slot
+                and group_last is not None
+                and group_last >= current_slot
+            )
+            if already_ran:
+                self.logger.info(
+                    "Skipping staff/group snapshot; already completed for slot %s", current_slot.strftime("%Y-%m-%d %H:%M")
+                )
+            else:
+                self._run_staff_group_snapshot(staff_label)
+
+        self.log_buffer.flush()
