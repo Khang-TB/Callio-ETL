@@ -5,6 +5,7 @@ import json
 import os
 import dotenv
 from dataclasses import dataclass
+from datetime import time as dt_time, timezone
 from typing import Optional, Tuple
 
 
@@ -100,9 +101,52 @@ class BigQueryConfig:
 
 @dataclass(frozen=True)
 class SchedulerConfig:
-    customer_interval_minutes: int = 15
-    call_interval_minutes: int = 15
-    staff_daily_hour: int = 9
+    run_times_utc: Tuple[dt_time, ...]
+    staff_group_time_utc: dt_time
+
+    @staticmethod
+    def _parse_time(value: str, *, field: str) -> dt_time:
+        try:
+            hour_str, minute_str = value.split(":", 1)
+            hour = int(hour_str)
+            minute = int(minute_str)
+        except ValueError as exc:  # pragma: no cover - defensive parsing
+            raise RuntimeError(f"Invalid time entry '{value}' for {field}; expected HH:MM") from exc
+
+        if not (0 <= hour < 24 and 0 <= minute < 60):
+            raise RuntimeError(
+                f"Invalid time entry '{value}' for {field}; hour must be 0-23 and minute 0-59"
+            )
+
+        return dt_time(hour=hour, minute=minute, tzinfo=timezone.utc)
+
+    @classmethod
+    def _parse_time_list(cls, raw: str, *, field: str) -> Tuple[dt_time, ...]:
+        items = []
+        for chunk in raw.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            items.append(cls._parse_time(chunk, field=field))
+        if not items:
+            raise RuntimeError(f"{field} must contain at least one HH:MM entry")
+        return tuple(sorted(items))
+
+    @classmethod
+    def from_env(cls) -> "SchedulerConfig":
+        run_times_raw = os.getenv(
+            "SCHEDULER_RUN_TIMES_UTC",
+            "02:30,04:00,06:00,08:00,11:00",
+        )
+        run_times = cls._parse_time_list(run_times_raw, field="SCHEDULER_RUN_TIMES_UTC")
+
+        staff_time_raw = os.getenv("SCHEDULER_STAFF_GROUP_TIME_UTC")
+        if staff_time_raw:
+            staff_time = cls._parse_time(staff_time_raw.strip(), field="SCHEDULER_STAFF_GROUP_TIME_UTC")
+        else:
+            staff_time = run_times[0]
+
+        return cls(run_times_utc=run_times, staff_group_time_utc=staff_time)
 
 
 @dataclass(frozen=True)
@@ -134,7 +178,7 @@ class PipelineConfig:
         return cls(
             api=CallioAPIConfig.from_env(),
             bigquery=BigQueryConfig.from_env(),
-            scheduler=SchedulerConfig(),
+            scheduler=SchedulerConfig.from_env(),
             window=WindowConfig.from_env(),
             log_level=log_level,
             limit_records_per_endpoint=limit_records_per_endpoint,
