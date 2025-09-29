@@ -100,7 +100,7 @@ class BigQueryService:
         dataset.location = self.config.location
         try:
             self.client.create_dataset(dataset)
-            self.logger.info("✅ Created dataset %s", self.config.dataset_id)
+            self.logger.info("Created dataset %s", self.config.dataset_id)
         except Conflict:
             pass
 
@@ -140,7 +140,7 @@ class BigQueryService:
                 field="NgayTao",
             )
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     def ensure_table_schema_staff(self) -> None:
         table_id = self.fqn("staff")
@@ -161,7 +161,7 @@ class BigQueryService:
             table = bigquery.Table(table_id, schema=schema)
             table.clustering_fields = ["tenant", "name"]
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     def ensure_table_schema_group(self) -> None:
         table_id = self.fqn("group")
@@ -178,7 +178,7 @@ class BigQueryService:
             table = bigquery.Table(table_id, schema=schema)
             table.clustering_fields = ["tenant", "group_id"]
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     def ensure_table_schema_customer(self) -> None:
         table_id = self.fqn("customer")
@@ -209,7 +209,7 @@ class BigQueryService:
                 field="NgayUpdate",
             )
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     def ensure_table_schema_customer_staging(self) -> None:
         table_id = self.fqn("stg_customer")
@@ -235,7 +235,7 @@ class BigQueryService:
             ]
             table = bigquery.Table(table_id, schema=schema)
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     def ensure_update_log(self) -> None:
         table_id = self.fqn("update_log")
@@ -257,7 +257,7 @@ class BigQueryService:
                 field="updated_at",
             )
             self.client.create_table(table)
-            self.logger.info("✅ Created table %s", table_id)
+            self.logger.info("Created table %s", table_id)
 
     # ------------------------------------------------------------------
     # Loading helpers

@@ -63,7 +63,7 @@ class CallioETLRunner:
             )
         cutoff = checkpoint - self.config.window.overlap_ms if checkpoint else checkpoint
         self.logger.info(
-            "[%s][customer] ck=%s (%s) overlap=%s → cutoff=%s",
+            "[%s][customer] ck=%s (%s) overlap=%s -> cutoff=%s",
             tenant,
             checkpoint,
             ms_to_iso(checkpoint),
@@ -75,7 +75,7 @@ class CallioETLRunner:
         email = account.email if account else None
         password = account.password if account else None
 
-        docs = self.api.fetch_desc_until(
+        fetch_result = self.api.fetch_desc_until(
             "customer",
             tenant,
             email,
@@ -85,10 +85,24 @@ class CallioETLRunner:
             limit_records=self.config.limit_records_per_endpoint,
             log_prefix=f"[{tenant}][customer]",
         )
+        docs = fetch_result.docs
         if not docs:
             self.log_buffer.add(tenant, table, 0, None, "NOOP")
             return (None, None), 0, checkpoint
 
+        if fetch_result.hit_result_window_limit:
+            oldest_ts = None
+            if docs:
+                try:
+                    oldest_ts = min(int(doc.get("updateTime") or 0) for doc in docs if doc.get("updateTime"))
+                except (TypeError, ValueError):
+                    oldest_ts = None
+            readable_oldest = ms_to_iso(oldest_ts) if oldest_ts else "unknown"
+            self.logger.warning(
+                "[%s][customer] API result window limit reached. Oldest staged updateTime=%s. Consider lowering DAYS_TO_FETCH_IF_EMPTY or running more frequently.",
+                tenant,
+                readable_oldest,
+            )
         df = pd.DataFrame(docs)
         df["user_id"] = extract_user_id(df)
         df["user_name"] = extract_user_name(df)
@@ -193,7 +207,7 @@ class CallioETLRunner:
         self.bq.execute_query(sql, job_config=job_config)
         cleanup_sql = f"DELETE FROM `{stg}` WHERE NgayUpdate BETWEEN @d_from AND @d_to"
         self.bq.execute_query(cleanup_sql, job_config=job_config)
-        self.logger.info("🧩 MERGE customer done for window [%s..%s]", start, end)
+        self.logger.info("MERGE customer done for window [%s..%s]", start, end)
 
     # ------------------------------------------------------------------
     # Call log flow
@@ -207,7 +221,7 @@ class CallioETLRunner:
             )
         cutoff = checkpoint
         self.logger.info(
-            "[%s][call_log] ck=%s (%s) → cutoff=%s (%s)",
+            "[%s][call_log] ck=%s (%s) -> cutoff=%s (%s)",
             tenant,
             checkpoint,
             ms_to_iso(checkpoint),
@@ -219,7 +233,7 @@ class CallioETLRunner:
         email = account.email if account else None
         password = account.password if account else None
 
-        docs = self.api.fetch_desc_until(
+        fetch_result = self.api.fetch_desc_until(
             "call",
             tenant,
             email,
@@ -229,10 +243,24 @@ class CallioETLRunner:
             limit_records=self.config.limit_records_per_endpoint,
             log_prefix=f"[{tenant}][call_log]",
         )
+        docs = fetch_result.docs
         if not docs:
             self.log_buffer.add(tenant, table, 0, checkpoint, "NOOP")
             return
 
+        if fetch_result.hit_result_window_limit:
+            oldest_ts = None
+            if docs:
+                try:
+                    oldest_ts = min(int(doc.get("createTime") or 0) for doc in docs if doc.get("createTime"))
+                except (TypeError, ValueError):
+                    oldest_ts = None
+            readable_oldest = ms_to_iso(oldest_ts) if oldest_ts else "unknown"
+            self.logger.warning(
+                "[%s][call_log] API result window limit reached. Oldest staged createTime=%s. Consider lowering DAYS_TO_FETCH_IF_EMPTY or running more frequently.",
+                tenant,
+                readable_oldest,
+            )
         df = pd.DataFrame(docs)
         if "_id" in df.columns and not df.empty:
             df = df.drop_duplicates(subset=["_id"], keep="last")
@@ -344,7 +372,7 @@ class CallioETLRunner:
             if "name" in df_all.columns:
                 df_all = df_all[df_all["name"].notna() & (df_all["name"].astype(str).str.strip() != "")]
             else:
-                self.logger.warning("[staff] Missing 'name' column — skipping load/merge")
+                self.logger.warning("[staff] Missing 'name' column - skipping load/merge")
                 df_all = pd.DataFrame()
 
             if not df_all.empty:
@@ -392,12 +420,12 @@ class CallioETLRunner:
         try:
             stg_table = self.bq.client.get_table(full_stg)
         except Exception:
-            self.logger.info("ℹ️ No staged staff to merge.")
+            self.logger.info("INFO No staged staff to merge.")
             return
 
         stg_columns = [field.name for field in stg_table.schema]
         if "name" not in stg_columns or "tenant" not in stg_columns:
-            self.logger.warning("⚠️ Staging %s missing tenant/name columns — skipping MERGE", full_stg)
+            self.logger.warning("WARN Staging %s missing tenant/name columns - skipping MERGE", full_stg)
             self.bq.client.delete_table(full_stg, not_found_ok=True)
             return
 
@@ -408,7 +436,7 @@ class CallioETLRunner:
             table.clustering_fields = ["tenant", "name"]
             self.bq.client.create_table(table)
             tgt_table = self.bq.client.get_table(full_tgt)
-            self.logger.info("✅ Created target: %s", full_tgt)
+            self.logger.info("Created target: %s", full_tgt)
 
         tgt_columns = [field.name for field in tgt_table.schema]
         exclude = {"tenant", "name"}
@@ -457,7 +485,7 @@ class CallioETLRunner:
           VALUES ({', '.join(insert_vals)})
         """
         self.bq.execute_query(sql)
-        self.logger.info("🧩 MERGE done: %s → %s", full_stg, full_tgt)
+        self.logger.info("MERGE done: %s -> %s", full_stg, full_tgt)
         self.bq.client.delete_table(full_stg, not_found_ok=True)
 
     # ------------------------------------------------------------------
@@ -495,7 +523,7 @@ class CallioETLRunner:
         loop_start = datetime.now(timezone.utc)
 
         if loop_start >= next_customer:
-            self.logger.info("▶ Run customer (all tenants) | interval=%sm", self.config.scheduler.customer_interval_minutes)
+            self.logger.info("Run customer (all tenants) | interval=%sm", self.config.scheduler.customer_interval_minutes)
             window_min, window_max = None, None
             staged_stats: Dict[str, Dict[str, Optional[int]]] = {}
             for account in track_progress(
@@ -525,7 +553,7 @@ class CallioETLRunner:
                             self.checkpoints.set_checkpoint("customer", tenant, max_update)
                             self.log_buffer.add(tenant, "customer", stats.get("rows", 0), max_update, "MERGED")
                             self.logger.info(
-                                "[%s][customer] MERGED window [%s..%s] → CK=%s",
+                                "[%s][customer] MERGED window [%s..%s] -> CK=%s",
                                 tenant,
                                 window_min,
                                 window_max,
@@ -537,7 +565,7 @@ class CallioETLRunner:
             next_customer = loop_start + timedelta(minutes=self.config.scheduler.customer_interval_minutes)
 
         if loop_start >= next_call:
-            self.logger.info("▶ Run call_log (all tenants) | interval=%sm", self.config.scheduler.call_interval_minutes)
+            self.logger.info("Run call_log (all tenants) | interval=%sm", self.config.scheduler.call_interval_minutes)
             for account in track_progress(
                 self.config.api.accounts,
                 "[call_log] syncing tenants",
@@ -555,7 +583,7 @@ class CallioETLRunner:
             next_call = loop_start + timedelta(minutes=self.config.scheduler.call_interval_minutes)
 
         if loop_start >= next_staffgrp:
-            self.logger.info("▶ Daily snapshot: staff + group (all tenants)")
+            self.logger.info("Daily snapshot: staff + group (all tenants)")
             self.snapshot_staff_group()
             next_staffgrp = self.next_daily(loop_start + timedelta(seconds=1), self.config.scheduler.staff_daily_hour)
 
@@ -572,7 +600,7 @@ class CallioETLRunner:
         group_last = self.checkpoints.get_last_run_any("group")
         next_customer, next_call, next_staffgrp = self.plan_initial_windows(now, staff_last, group_last)
         self.logger.info(
-            "⏱️ Schedule boot | customer/call: now | staff/group: %s",
+            "Schedule boot | customer/call: now | staff/group: %s",
             next_staffgrp,
         )
 
@@ -586,10 +614,10 @@ class CallioETLRunner:
                 next_due = min(next_customer, next_call, next_staffgrp)
                 wait_seconds = int((next_due - datetime.now(timezone.utc)).total_seconds())
                 wait_seconds = max(1, min(300, wait_seconds))
-                self.logger.info("⏳ Idle %ss — next due @ %s UTC", wait_seconds, next_due.isoformat())
+                self.logger.info("Idle %ss - next due @ %s UTC", wait_seconds, next_due.isoformat())
                 time.sleep(wait_seconds)
             except KeyboardInterrupt:
-                self.logger.warning("⛔ Stopped by user")
+                self.logger.warning("Stopped by user")
                 break
             except Exception:
                 self.logger.exception("Loop-level error; retrying in 10s")

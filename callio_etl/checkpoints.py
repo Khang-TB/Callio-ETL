@@ -46,7 +46,7 @@ class UpdateLogBuffer:
         if "max_update_time" in df.columns:
             df = df.rename(columns={"max_update_time": "max_updateTime"})
         self.bq.load_append(df, "update_log")
-        self.logger.info("📝 Flushed update_log: %d rows", len(self._pending))
+        self.logger.info("Flushed update_log: %d rows", len(self._pending))
         self._pending.clear()
 
 
@@ -75,7 +75,7 @@ class CheckpointStore:
                 last_run_at = last_run_at.replace(tzinfo=timezone.utc)
             self._checkpoints[(table, tenant)] = checkpoint
             self._last_run[(table, tenant)] = last_run_at
-        self.logger.info("🔥 Warmed checkpoint cache: %d keys", len(self._checkpoints))
+        self.logger.info("Warmed checkpoint cache: %d keys", len(self._checkpoints))
 
     @staticmethod
     def _normalize_table(name: str) -> str:

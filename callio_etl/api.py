@@ -14,6 +14,11 @@ from .utils import ms_to_iso, pct, safe_eval
 
 
 @dataclass
+class FetchResult:
+    docs: List[Dict[str, Any]]
+    hit_result_window_limit: bool = False
+
+@dataclass
 class CallioAPI:
     config: CallioAPIConfig
     logger: any
@@ -89,7 +94,7 @@ class CallioAPI:
         *,
         limit_records: Optional[int],
         log_prefix: str = "",
-    ) -> List[Dict[str, Any]]:
+    ) -> FetchResult:
         token = self.get_token(tenant, email, password)
         if not token:
             raise RuntimeError(f"[{tenant}] Cannot obtain token")
@@ -97,6 +102,7 @@ class CallioAPI:
         headers = {"token": token}
         page = 1
         all_docs: List[Dict[str, Any]] = []
+        limit_hit = False
         window_end_ms = int(time.time() * 1000)
         denom = max(1, window_end_ms - int(cutoff_ms or 0))
 
@@ -111,7 +117,7 @@ class CallioAPI:
                     timeout=self.config.timeout,
                 )
                 if response.status_code == 401:
-                    self.logger.warning("%s 401 on page=%s → refreshing token", log_prefix, page)
+                    self.logger.warning("%s 401 on page=%s -> refreshing token", log_prefix, page)
                     token = self.get_token(tenant, email, password, force=True)
                     if not token:
                         raise RuntimeError(f"[{tenant}] token refresh failed")
@@ -123,7 +129,15 @@ class CallioAPI:
                         timeout=self.config.timeout,
                     )
 
-                response.raise_for_status()
+                try:
+                    response.raise_for_status()
+                except requests.HTTPError as exc:
+                    if response.status_code == 400 and "Result window is too large" in (response.text or ""):
+                        limit_hit = True
+                        self.logger.warning("%s result window limit reached after page=%s; collected %s rows", log_prefix, page, len(all_docs))
+                        bar.update(task_id, description=f"{progress_label} hit API limit")
+                        break
+                    raise
                 payload = response.json() or {}
                 docs = payload.get("docs") or []
                 total_docs = payload.get("totalDocs") or payload.get("total")
@@ -159,7 +173,7 @@ class CallioAPI:
                 )
 
                 self.logger.info(
-                    "%s page=%s got=%s cum=%s last_ts=%s window=[%s → %s] time_coverage≈%s totalDocs=%s hasNext=%s",
+                    "%s page=%s got=%s cum=%s last_ts=%s window=[%s -> %s] time_coverage~%s totalDocs=%s hasNext=%s",
                     log_prefix,
                     page,
                     count_this_page,
@@ -184,15 +198,17 @@ class CallioAPI:
 
             bar.update(task_id, description=f"{progress_label} done")
 
+        status_note = " (API result window limit hit)" if limit_hit else ""
         self.logger.info(
-            "%s DONE pages=%s loaded=%s range=[%s → %s]",
+            "%s DONE pages=%s loaded=%s range=[%s -> %s]%s",
             log_prefix,
             page,
             len(all_docs),
             ms_to_iso(cutoff_ms),
             ms_to_iso(all_docs[0].get(time_field) if all_docs else None),
+            status_note,
         )
-        return all_docs
+        return FetchResult(all_docs, limit_hit)
 
     def fetch_staff(self, tenant: str) -> pd.DataFrame:
         account = self.config.find_account(tenant)
@@ -209,7 +225,7 @@ class CallioAPI:
             timeout=self.config.timeout,
         )
         if response.status_code == 401:
-            self.logger.warning("[%s][staff] 401 → refreshing token", tenant)
+            self.logger.warning("[%s][staff] 401 -> refreshing token", tenant)
             token = self.get_token(tenant, email, password, force=True)
             response = requests.get(
                 f"{self.config.base_url}/user",
@@ -237,7 +253,7 @@ class CallioAPI:
             timeout=self.config.timeout,
         )
         if response.status_code == 401:
-            self.logger.warning("[%s][%s] 401 → refreshing token", tenant, endpoint_url)
+            self.logger.warning("[%s][%s] 401 -> refreshing token", tenant, endpoint_url)
             token = self.get_token(tenant, email, password, force=True)
             response = requests.get(
                 endpoint_url,
