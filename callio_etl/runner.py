@@ -303,7 +303,9 @@ class CallioETLRunner:
 
         self.bq.ensure_table_schema_call_log()
         loaded = self.bq.load_append(out, "call_log")
-        max_create = int(out["createTime"].max()) if "createTime" in out.columns and not out["createTime"].empty else checkpoint
+        max_create = (
+            int(out["createTime"].max()) if "createTime" in out.columns and not out["createTime"].empty else checkpoint
+        )
         if max_create is not None and (self.checkpoints.get_checkpoint(table, tenant) is None or max_create > checkpoint):
             self.checkpoints.set_checkpoint(table, tenant, max_create)
         new_ck = self.checkpoints.get_checkpoint(table, tenant)

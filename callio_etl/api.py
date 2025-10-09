@@ -100,44 +100,66 @@ class CallioAPI:
             raise RuntimeError(f"[{tenant}] Cannot obtain token")
 
         headers = {"token": token}
-        page = 1
-        all_docs: List[Dict[str, Any]] = []
-        limit_hit = False
         window_end_ms = int(time.time() * 1000)
         denom = max(1, window_end_ms - int(cutoff_ms or 0))
-
         progress_label = log_prefix or f"[{tenant}][{endpoint}]"
-        with progress_task(f"{progress_label} fetching", transient=False) as (bar, task_id):
-            while True:
-                params = {"page": page, "pageSize": self.config.page_size, "sort": f"{time_field}DESC"}
+        min_slice_ms = max(1, getattr(self.config, "min_slice_ms", 60 * 60 * 1000))
+        default_slice_ms = max(0, getattr(self.config, "time_slice_ms", 24 * 60 * 60 * 1000))
+
+        def perform_request(params: Dict[str, Any]) -> requests.Response:
+            nonlocal token, headers
+            response = requests.get(
+                f"{self.config.base_url}/{endpoint}",
+                headers=headers,
+                params=params,
+                timeout=self.config.timeout,
+            )
+            if response.status_code == 401:
+                self.logger.warning("%s 401 on page=%s -> refreshing token", log_prefix, params.get("page"))
+                token = self.get_token(tenant, email, password, force=True)
+                if not token:
+                    raise RuntimeError(f"[{tenant}] token refresh failed")
+                headers = {"token": token}
                 response = requests.get(
                     f"{self.config.base_url}/{endpoint}",
                     headers=headers,
                     params=params,
                     timeout=self.config.timeout,
                 )
-                if response.status_code == 401:
-                    self.logger.warning("%s 401 on page=%s -> refreshing token", log_prefix, page)
-                    token = self.get_token(tenant, email, password, force=True)
-                    if not token:
-                        raise RuntimeError(f"[{tenant}] token refresh failed")
-                    headers = {"token": token}
-                    response = requests.get(
-                        f"{self.config.base_url}/{endpoint}",
-                        headers=headers,
-                        params=params,
-                        timeout=self.config.timeout,
-                    )
+            return response
 
+        def fetch_slice(range_start_ms: int, range_end_ms: int) -> Tuple[List[Dict[str, Any]], bool]:
+            slice_docs: List[Dict[str, Any]] = []
+            slice_limit_hit = False
+            page = 1
+            while True:
+                params: Dict[str, Any] = {
+                    "page": page,
+                    "pageSize": self.config.page_size,
+                    "sort": f"{time_field}DESC",
+                }
+                if range_start_ms is not None:
+                    params["from"] = max(0, int(range_start_ms))
+                if range_end_ms is not None:
+                    params["to"] = max(0, int(range_end_ms))
+
+                response = perform_request(params)
                 try:
                     response.raise_for_status()
                 except requests.HTTPError as exc:
                     if response.status_code == 400 and "Result window is too large" in (response.text or ""):
-                        limit_hit = True
-                        self.logger.warning("%s result window limit reached after page=%s; collected %s rows", log_prefix, page, len(all_docs))
-                        bar.update(task_id, description=f"{progress_label} hit API limit")
+                        slice_limit_hit = True
+                        self.logger.warning(
+                            "%s result window limit within slice [%s -> %s] at page=%s; collected %s rows",
+                            log_prefix,
+                            ms_to_iso(range_start_ms),
+                            ms_to_iso(range_end_ms),
+                            page,
+                            len(slice_docs),
+                        )
                         break
                     raise
+
                 payload = response.json() or {}
                 docs = payload.get("docs") or []
                 total_docs = payload.get("totalDocs") or payload.get("total")
@@ -150,65 +172,132 @@ class CallioAPI:
                     if timestamp <= cutoff_ms:
                         stop_flag = True
                         break
-                    all_docs.append(doc)
+                    slice_docs.append(doc)
                     count_this_page += 1
 
-                last_ts = int(all_docs[-1].get(time_field)) if all_docs else None
-                coverage = (window_end_ms - (last_ts or window_end_ms)) / denom if denom > 0 else 0.0
-
-                if total_docs:
-                    try:
-                        total_value = int(total_docs)
-                    except (TypeError, ValueError):
-                        total_value = None
-                    else:
-                        bar.update(task_id, total=total_value)
-
-                bar.update(
-                    task_id,
-                    advance=count_this_page,
-                    description=(
-                        f"{progress_label} page={page} loaded={len(all_docs)} coverage={pct(coverage)}"
-                    ),
-                )
-
+                last_ts = int(slice_docs[-1].get(time_field)) if slice_docs else None
                 self.logger.info(
-                    "%s page=%s got=%s cum=%s last_ts=%s window=[%s -> %s] time_coverage~%s totalDocs=%s hasNext=%s",
+                    "%s slice=[%s -> %s] page=%s got=%s cum=%s last_ts=%s totalDocs=%s hasNext=%s",
                     log_prefix,
+                    ms_to_iso(range_start_ms),
+                    ms_to_iso(range_end_ms),
                     page,
                     count_this_page,
-                    len(all_docs),
+                    len(slice_docs),
                     ms_to_iso(last_ts),
-                    ms_to_iso(cutoff_ms),
-                    ms_to_iso(window_end_ms),
-                    pct(coverage),
                     total_docs,
                     has_next and not stop_flag,
                 )
-
-                if limit_records and len(all_docs) >= limit_records:
-                    all_docs = all_docs[:limit_records]
-                    self.logger.info("%s hit LIMIT_RECORDS_PER_ENDPOINT=%s", log_prefix, limit_records)
-                    break
 
                 if stop_flag or not has_next:
                     break
 
                 page += 1
 
+            return slice_docs, slice_limit_hit
+
+        def initial_slices(start_ms: int, end_ms: int) -> List[Tuple[int, int]]:
+            if default_slice_ms == 0:
+                return [(start_ms, end_ms)]
+            slices: List[Tuple[int, int]] = []
+            cursor_end = end_ms
+            while cursor_end > start_ms:
+                cursor_start = max(start_ms, cursor_end - default_slice_ms)
+                slices.append((cursor_start, cursor_end))
+                cursor_end = cursor_start - 1
+            return slices or [(start_ms, end_ms)]
+
+        slice_stack = list(reversed(initial_slices(cutoff_ms, window_end_ms)))
+        doc_store: Dict[str, Dict[str, Any]] = {}
+        limit_hit = False
+        processed = 0
+
+        with progress_task(f"{progress_label} fetching", transient=False) as (bar, task_id):
+            bar.update(task_id, description=f"{progress_label} initializing")
+
+            def add_docs(docs: Sequence[Dict[str, Any]]) -> bool:
+                nonlocal processed
+                for doc in docs:
+                    timestamp = int(doc.get(time_field) or 0)
+                    if timestamp <= cutoff_ms:
+                        continue
+                    key = doc.get("_id") or f"{timestamp}:{doc.get('id') or len(doc_store)}"
+                    if key in doc_store:
+                        continue
+                    doc_store[key] = doc
+                    processed += 1
+                    coverage = (window_end_ms - timestamp) / denom if denom > 0 else 0.0
+                    bar.update(
+                        task_id,
+                        advance=1,
+                        description=f"{progress_label} loaded={processed} coverage={pct(coverage)}",
+                    )
+                    if limit_records and processed >= limit_records:
+                        return True
+                return False
+
+            while slice_stack:
+                range_start_ms, range_end_ms = slice_stack.pop()
+                if range_end_ms <= range_start_ms:
+                    continue
+
+                bar.update(
+                    task_id,
+                    description=(
+                        f"{progress_label} slice[{ms_to_iso(range_start_ms)} -> {ms_to_iso(range_end_ms)}] "
+                        f"loaded={processed}"
+                    ),
+                )
+
+                slice_docs, slice_limit_hit = fetch_slice(range_start_ms, range_end_ms)
+
+                if add_docs(slice_docs):
+                    slice_stack.clear()
+                    break
+
+                if slice_limit_hit:
+                    limit_hit = True
+                    oldest_ts = min(
+                        (int(doc.get(time_field) or 0) for doc in slice_docs if doc.get(time_field)),
+                        default=None,
+                    )
+                    if oldest_ts is not None and oldest_ts > range_start_ms:
+                        next_end = max(range_start_ms, oldest_ts - 1)
+                        if next_end > range_start_ms:
+                            slice_stack.append((range_start_ms, next_end))
+                            continue
+
+                    span = range_end_ms - range_start_ms
+                    if span > min_slice_ms:
+                        mid = range_start_ms + span // 2
+                        if mid > range_start_ms:
+                            slice_stack.append((range_start_ms, mid))
+                        if mid + 1 < range_end_ms:
+                            slice_stack.append((mid + 1, range_end_ms))
+                    else:
+                        self.logger.warning(
+                            "%s cannot split slice [%s -> %s] further; some rows may remain un-fetched.",
+                            log_prefix,
+                            ms_to_iso(range_start_ms),
+                            ms_to_iso(range_end_ms),
+                        )
+
             bar.update(task_id, description=f"{progress_label} done")
+
+        all_docs = sorted(doc_store.values(), key=lambda doc: int(doc.get(time_field) or 0), reverse=True)
+        if limit_records:
+            all_docs = all_docs[:limit_records]
 
         status_note = " (API result window limit hit)" if limit_hit else ""
         self.logger.info(
-            "%s DONE pages=%s loaded=%s range=[%s -> %s]%s",
+            "%s DONE loaded=%s range=[%s -> %s]%s",
             log_prefix,
-            page,
             len(all_docs),
             ms_to_iso(cutoff_ms),
             ms_to_iso(all_docs[0].get(time_field) if all_docs else None),
             status_note,
         )
-        return FetchResult(all_docs, limit_hit)
+        return FetchResult(list(all_docs), limit_hit)
 
     def fetch_staff(self, tenant: str) -> pd.DataFrame:
         account = self.config.find_account(tenant)

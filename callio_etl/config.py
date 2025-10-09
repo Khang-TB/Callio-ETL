@@ -21,6 +21,8 @@ class CallioAPIConfig:
     base_url: str
     timeout: int
     page_size: int
+    time_slice_ms: int
+    min_slice_ms: int
     accounts: Tuple[Account, ...]
 
     @classmethod
@@ -28,6 +30,24 @@ class CallioAPIConfig:
         base_url = os.getenv("CALLIO_API_BASE_URL", "https://clientapi.phonenet.io")
         timeout = int(os.getenv("API_TIMEOUT", "90"))
         page_size = int(os.getenv("API_PAGE_SIZE", "500"))
+
+        slice_ms_raw = os.getenv("API_TIME_SLICE_MS")
+        if slice_ms_raw is None:
+            time_slice_ms = 24 * 60 * 60 * 1000  # default: 24h window per slice
+        else:
+            try:
+                time_slice_ms = max(0, int(slice_ms_raw))
+            except ValueError as exc:
+                raise RuntimeError("API_TIME_SLICE_MS must be an integer number of milliseconds") from exc
+
+        min_slice_ms_raw = os.getenv("API_MIN_SLICE_MS")
+        if min_slice_ms_raw is None:
+            min_slice_ms = 60 * 60 * 1000  # default: 1h minimum slice
+        else:
+            try:
+                min_slice_ms = max(1, int(min_slice_ms_raw))
+            except ValueError as exc:
+                raise RuntimeError("API_MIN_SLICE_MS must be a positive integer number of milliseconds") from exc
 
         raw_accounts = dotenv.get_key(dotenv.find_dotenv(), "CALLIO_ACCOUNTS_JSON")
         accounts_path = os.getenv("CALLIO_ACCOUNTS_FILE")
@@ -60,7 +80,14 @@ class CallioAPIConfig:
             account_dicts.append(item)
 
         accounts = tuple(Account(**item) for item in account_dicts)
-        return cls(base_url=base_url, timeout=timeout, page_size=page_size, accounts=accounts)
+        return cls(
+            base_url=base_url,
+            timeout=timeout,
+            page_size=page_size,
+            time_slice_ms=time_slice_ms,
+            min_slice_ms=min_slice_ms,
+            accounts=accounts,
+        )
 
     def find_account(self, tenant: str) -> Optional[Account]:
         return next((acc for acc in self.accounts if acc.tenant == tenant), None)
