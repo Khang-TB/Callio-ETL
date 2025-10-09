@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import pandas as pd
 import requests
@@ -21,7 +21,7 @@ class FetchResult:
 @dataclass
 class CallioAPI:
     config: CallioAPIConfig
-    logger: any
+    logger: Any
     _tokens: Dict[str, Tuple[str, float]] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
@@ -106,6 +106,26 @@ class CallioAPI:
         min_slice_ms = max(1, getattr(self.config, "min_slice_ms", 60 * 60 * 1000))
         default_slice_ms = max(0, getattr(self.config, "time_slice_ms", 24 * 60 * 60 * 1000))
 
+        def _to_int_timestamp(value: Any) -> int:
+            """Best-effort conversion of a timestamp-like value to int milliseconds."""
+
+            if value is None:
+                return 0
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                value = value.strip()
+                if not value:
+                    return 0
+                try:
+                    return int(float(value))
+                except ValueError:
+                    return 0
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+
         def perform_request(params: Dict[str, Any]) -> requests.Response:
             nonlocal token, headers
             response = requests.get(
@@ -168,14 +188,14 @@ class CallioAPI:
                 stop_flag = False
 
                 for doc in docs:
-                    timestamp = int(doc.get(time_field) or 0)
+                    timestamp = _to_int_timestamp(doc.get(time_field))
                     if timestamp <= cutoff_ms:
                         stop_flag = True
                         break
                     slice_docs.append(doc)
                     count_this_page += 1
 
-                last_ts = int(slice_docs[-1].get(time_field)) if slice_docs else None
+                last_ts = _to_int_timestamp(slice_docs[-1].get(time_field)) if slice_docs else None
                 self.logger.info(
                     "%s slice=[%s -> %s] page=%s got=%s cum=%s last_ts=%s totalDocs=%s hasNext=%s",
                     log_prefix,
@@ -218,7 +238,7 @@ class CallioAPI:
             def add_docs(docs: Sequence[Dict[str, Any]]) -> bool:
                 nonlocal processed
                 for doc in docs:
-                    timestamp = int(doc.get(time_field) or 0)
+                    timestamp = _to_int_timestamp(doc.get(time_field))
                     if timestamp <= cutoff_ms:
                         continue
                     key = doc.get("_id") or f"{timestamp}:{doc.get('id') or len(doc_store)}"
@@ -258,7 +278,11 @@ class CallioAPI:
                 if slice_limit_hit:
                     limit_hit = True
                     oldest_ts = min(
-                        (int(doc.get(time_field) or 0) for doc in slice_docs if doc.get(time_field)),
+                        (
+                            _to_int_timestamp(doc.get(time_field))
+                            for doc in slice_docs
+                            if doc.get(time_field) is not None
+                        ),
                         default=None,
                     )
                     if oldest_ts is not None and oldest_ts > range_start_ms:
@@ -284,7 +308,7 @@ class CallioAPI:
 
             bar.update(task_id, description=f"{progress_label} done")
 
-        all_docs = sorted(doc_store.values(), key=lambda doc: int(doc.get(time_field) or 0), reverse=True)
+        all_docs = sorted(doc_store.values(), key=lambda doc: _to_int_timestamp(doc.get(time_field)), reverse=True)
         if limit_records:
             all_docs = all_docs[:limit_records]
 
@@ -351,7 +375,11 @@ class CallioAPI:
             )
         response.raise_for_status()
         payload = response.json() or {}
-        docs: Optional[Sequence[Dict[str, Any]]] = payload.get("docs") or payload
-        if not isinstance(docs, list):
-            docs = []
-        return pd.DataFrame(docs)
+        docs_seq: Sequence[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            docs_candidate = payload.get("docs")
+            if isinstance(docs_candidate, list):
+                docs_seq = docs_candidate
+        elif isinstance(payload, list):
+            docs_seq = cast(Sequence[Dict[str, Any]], payload)
+        return pd.DataFrame(list(docs_seq))
