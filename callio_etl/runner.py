@@ -652,7 +652,7 @@ class CallioETLRunner:
               DATE(TIMESTAMP_MILLIS(assignedTime), 'Asia/Ho_Chi_Minh') AS Ngay,
               CAST(user_id AS STRING)              AS MaNV_id,
               ANY_VALUE(CAST(user_name AS STRING))     AS MaNV,
-              ANY_VALUE(CAST(user_group_id AS STRING)) AS group_id,
+              ANY_VALUE(COALESCE(g.name, 'Unassigned')) AS Team,
               'PK'                                     AS Tenant,        -- cố định
               COUNT(DISTINCT _id) AS SoDataNhan,
               MAX(assignedTime)   AS max_assigned_ms
@@ -660,24 +660,12 @@ class CallioETLRunner:
                    DATE(TIMESTAMP_MILLIS(last_ms), 'Asia/Ho_Chi_Minh'),
                    CURRENT_DATE('Asia/Ho_Chi_Minh')
                  )
+            LEFT JOIN `rio-system-migration.dev_callio`.`group` g
+              ON CAST(user_group_id AS STRING) = CAST(g.group_id AS STRING)
             WHERE tenant = 'PK'                                           -- ✅ PK only
               AND assignedTime >  last_ms
               AND assignedTime <= UNIX_MILLIS(now_ts)
             GROUP BY Ngay, MaNV_id
-          ),
-
-          agg_assigned AS (
-            SELECT
-              a.Ngay, a.MaNV_id,
-              ANY_VALUE(a.MaNV)   AS MaNV,
-              ANY_VALUE(a.Tenant) AS Tenant,
-              ANY_VALUE(g.name)   AS Team,
-              MAX(a.SoDataNhan)   AS SoDataNhan,
-              MAX(a.max_assigned_ms) AS max_assigned_ms
-            FROM assigned a
-            LEFT JOIN `rio-system-migration.dev_callio`.`group` g
-              ON CAST(a.group_id AS STRING) = CAST(g.group_id AS STRING)
-            GROUP BY a.Ngay, a.MaNV_id
           ),
 
           S AS (
@@ -700,7 +688,7 @@ class CallioETLRunner:
               IFNULL(s.max_assigned_ms, 0)           AS max_assigned_ms,
               now_ts                                  AS _ingested_at
             FROM calls c
-            FULL OUTER JOIN agg_assigned s
+            FULL OUTER JOIN assigned s
               ON c.Ngay    = s.Ngay
              AND c.MaNV_id = s.MaNV_id
             WHERE COALESCE(c.MaNV_id, s.MaNV_id) IS NOT NULL
