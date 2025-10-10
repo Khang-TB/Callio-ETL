@@ -583,6 +583,308 @@ class CallioETLRunner:
         self.logger.info("Daily snapshot: staff + group (all tenants) | schedule=%s UTC", staff_label)
         self.snapshot_staff_group()
 
+    # ------------------------------------------------------------------
+    # Reporting flows
+    # ------------------------------------------------------------------
+    def run_fact_staff_daily_pk_refresh(self) -> None:
+        self.logger.info("Running reporting refresh for fact_staff_daily_PK")
+        sql = """
+        DECLARE now_ts      TIMESTAMP DEFAULT CURRENT_TIMESTAMP();
+        DECLARE last_ms_raw INT64 DEFAULT COALESCE((
+          SELECT MAX(GREATEST(IFNULL(max_create_ms,0), IFNULL(max_assigned_ms,0)))
+          FROM `rio-system-migration.dev_callio.fact_staff_daily_PK`
+          WHERE Tenant = 'PK'
+            AND Ngay >= DATE_SUB(CURRENT_DATE('Asia/Ho_Chi_Minh'), INTERVAL 7 DAY)
+        ), 0);
+        DECLARE last_ms INT64 DEFAULT IF(last_ms_raw = 0,
+          UNIX_MILLIS(TIMESTAMP_SUB(now_ts, INTERVAL 30 DAY)),
+          last_ms_raw
+        );
+
+        DECLARE part_min DATE DEFAULT DATE(TIMESTAMP_MILLIS(last_ms), 'Asia/Ho_Chi_Minh');
+        DECLARE part_max DATE DEFAULT CURRENT_DATE('Asia/Ho_Chi_Minh');
+
+        -- =========================
+        -- 1) BIẾN THỜI GIAN (INCR)
+        -- =========================
+
+
+        -- ============================================================
+        -- 2) MERGE #A — GỌI + DATA NHẬN (Tenant = 'PK')
+        -- ============================================================
+        MERGE `rio-system-migration.dev_callio.fact_staff_daily_PK` AS T
+        USING (
+          WITH
+          calls AS (
+            SELECT
+              DATE(TIMESTAMP_MILLIS(l.createTime), 'Asia/Ho_Chi_Minh') AS Ngay,
+              CAST(l.fromUser__id AS STRING)              AS MaNV_id,
+              ANY_VALUE(CAST(l.fromUser__name AS STRING)) AS MaNV,
+              ANY_VALUE(COALESCE(g.name, 'Unassigned'))   AS Team,
+              'PK'                                         AS Tenant,            -- cố định
+
+              COUNT(*)                                     AS TongCuoc,
+              COUNT(DISTINCT l.toNumber)                   AS SoSDT_Unique,
+              COUNTIF(l.billDuration > 0)                  AS SoCuoc_NoiMay,
+              COUNTIF(l.billDuration = 0)                  AS SoCuoc_KhongNoiMay,
+              SUM(CASE WHEN l.billDuration > 0 THEN CAST(l.billDuration AS FLOAT64) ELSE 0 END)
+                AS TongThoiluongGoi_Giay,
+              SUM(CASE
+                    WHEN l.billDuration = 0 AND l.endTime IS NOT NULL AND l.startTime IS NOT NULL
+                    THEN GREATEST(
+                      SAFE_DIVIDE(CAST(l.endTime - l.startTime AS FLOAT64), 1000.0)
+                      - CAST(l.billDuration AS FLOAT64), 0)
+                    ELSE 0 END) AS TongRungChuong_Giay,
+
+              MAX(l.createTime) AS max_create_ms
+            FROM `rio-system-migration.dev_callio.call_log` l
+            LEFT JOIN `rio-system-migration.dev_callio`.`group` g
+              ON CAST(l.fromGroup__id AS STRING) = CAST(g.group_id AS STRING)
+            WHERE l.tenant = 'PK'                                            -- ✅ PK only
+              AND l.createTime >  last_ms
+              AND l.createTime <= UNIX_MILLIS(now_ts)
+              AND l.NgayTao BETWEEN part_min AND part_max
+            GROUP BY Ngay, MaNV_id
+          ),
+
+          assigned AS (
+            SELECT
+              DATE(TIMESTAMP_MILLIS(assignedTime), 'Asia/Ho_Chi_Minh') AS Ngay,
+              CAST(user_id AS STRING)              AS MaNV_id,
+              ANY_VALUE(CAST(user_name AS STRING))     AS MaNV,
+              ANY_VALUE(CAST(user_group_id AS STRING)) AS group_id,
+              'PK'                                     AS Tenant,        -- cố định
+              COUNT(DISTINCT _id) AS SoDataNhan,
+              MAX(assignedTime)   AS max_assigned_ms
+            FROM `rio-system-migration.dev_callio.customer_in_range`(
+                   DATE(TIMESTAMP_MILLIS(last_ms), 'Asia/Ho_Chi_Minh'),
+                   CURRENT_DATE('Asia/Ho_Chi_Minh')
+                 )
+            WHERE tenant = 'PK'                                           -- ✅ PK only
+              AND assignedTime >  last_ms
+              AND assignedTime <= UNIX_MILLIS(now_ts)
+            GROUP BY Ngay, MaNV_id
+          ),
+
+          agg_assigned AS (
+            SELECT
+              a.Ngay, a.MaNV_id,
+              ANY_VALUE(a.MaNV)   AS MaNV,
+              ANY_VALUE(a.Tenant) AS Tenant,
+              ANY_VALUE(g.name)   AS Team,
+              MAX(a.SoDataNhan)   AS SoDataNhan,
+              MAX(a.max_assigned_ms) AS max_assigned_ms
+            FROM assigned a
+            LEFT JOIN `rio-system-migration.dev_callio`.`group` g
+              ON CAST(a.group_id AS STRING) = CAST(g.group_id AS STRING)
+            GROUP BY a.Ngay, a.MaNV_id
+          ),
+
+          S AS (
+            SELECT
+              COALESCE(c.Ngay, s.Ngay)       AS Ngay,
+              'PK'                            AS Tenant,                  -- chuẩn hóa
+              COALESCE(c.Team, s.Team)       AS Team,
+              COALESCE(c.MaNV_id, s.MaNV_id) AS MaNV_id,
+              COALESCE(c.MaNV,    s.MaNV)    AS MaNV,
+
+              IFNULL(c.TongCuoc,              0) AS TongCuoc,
+              IFNULL(c.SoSDT_Unique,          0) AS SoSDT_Unique,
+              IFNULL(c.SoCuoc_NoiMay,         0) AS SoCuoc_NoiMay,
+              IFNULL(c.SoCuoc_KhongNoiMay,    0) AS SoCuoc_KhongNoiMay,
+              IFNULL(c.TongThoiluongGoi_Giay, 0) AS TongThoiluongGoi_Giay,
+              IFNULL(c.TongRungChuong_Giay,   0) AS TongRungChuong_Giay,
+              IFNULL(s.SoDataNhan,            0) AS SoDataNhan,
+
+              GREATEST(IFNULL(c.max_create_ms, 0), 0) AS max_create_ms,
+              IFNULL(s.max_assigned_ms, 0)           AS max_assigned_ms,
+              now_ts                                  AS _ingested_at
+            FROM calls c
+            FULL OUTER JOIN agg_assigned s
+              ON c.Ngay    = s.Ngay
+             AND c.MaNV_id = s.MaNV_id
+            WHERE COALESCE(c.MaNV_id, s.MaNV_id) IS NOT NULL
+          )
+          SELECT * FROM S
+        ) AS S
+        ON  T.Ngay    = S.Ngay
+        AND T.MaNV_id = S.MaNV_id
+        AND T.Ngay BETWEEN part_min AND part_max
+
+        WHEN MATCHED THEN UPDATE SET
+          T.Tenant                 = 'PK',
+          T.Team                   = S.Team,
+          T.MaNV                   = S.MaNV,
+          T.TongCuoc               = S.TongCuoc,
+          T.SoSDT_Unique           = S.SoSDT_Unique,
+          T.SoCuoc_NoiMay          = S.SoCuoc_NoiMay,
+          T.SoCuoc_KhongNoiMay     = S.SoCuoc_KhongNoiMay,
+          T.TongThoiluongGoi_Giay  = S.TongThoiluongGoi_Giay,
+          T.TongRungChuong_Giay    = S.TongRungChuong_Giay,
+          T.SoDataNhan             = S.SoDataNhan,
+          T.max_create_ms          = S.max_create_ms,
+          T.max_assigned_ms        = S.max_assigned_ms,
+          T._ingested_at           = S._ingested_at
+
+        WHEN NOT MATCHED THEN INSERT (
+          Ngay, Tenant, Team, MaNV_id, MaNV,
+          TongCuoc, SoSDT_Unique, SoCuoc_NoiMay, SoCuoc_KhongNoiMay,
+          TongThoiluongGoi_Giay, TongRungChuong_Giay, SoDataNhan,
+          max_create_ms, max_assigned_ms, _ingested_at
+        ) VALUES (
+          S.Ngay, 'PK', S.Team, S.MaNV_id, S.MaNV,
+          S.TongCuoc, S.SoSDT_Unique, S.SoCuoc_NoiMay, S.SoCuoc_KhongNoiMay,
+          S.TongThoiluongGoi_Giay, S.TongRungChuong_Giay, S.SoDataNhan,
+          S.max_create_ms, S.max_assigned_ms, S._ingested_at
+        );
+
+        -- ============================================================
+        -- 3) MERGE #B — STATUS 7 NGÀY (Tenant = 'PK')
+        -- ============================================================
+        MERGE `rio-system-migration.dev_callio.fact_staff_daily_PK` T
+        USING (
+          WITH
+          win AS (
+            SELECT
+              DATE_SUB(CURRENT_DATE('Asia/Ho_Chi_Minh'), INTERVAL 7 DAY) AS d_start,
+              CURRENT_DATE('Asia/Ho_Chi_Minh')                           AS d_end
+          ),
+
+          -- Staff dims từ nguồn PK
+          staff_from_calls AS (
+            SELECT
+              DATE(l.NgayTao)                             AS Ngay,
+              CAST(l.fromUser__id AS STRING)              AS MaNV_id,
+              ANY_VALUE(CAST(l.fromUser__name AS STRING)) AS MaNV,
+              'PK'                                        AS Tenant,
+              ANY_VALUE(CAST(l.fromGroup__id AS STRING))  AS group_id
+            FROM `rio-system-migration.dev_callio.call_log` l, win
+            WHERE l.tenant = 'PK'                                        -- ✅ PK only
+              AND l.NgayTao BETWEEN win.d_start AND win.d_end
+            GROUP BY Ngay, MaNV_id
+          ),
+          staff_from_cus AS (
+            SELECT
+              COALESCE(NgayAssign, NgayUpdate)            AS Ngay,
+              CAST(user_id AS STRING)                     AS MaNV_id,
+              ANY_VALUE(CAST(user_name AS STRING))        AS MaNV,
+              'PK'                                        AS Tenant
+              ,ANY_VALUE(CAST(user_group_id AS STRING))   AS group_id
+            FROM `rio-system-migration.dev_callio.customer`, win
+            WHERE tenant = 'PK'                                            -- ✅ PK only
+              AND ((NgayAssign BETWEEN win.d_start AND win.d_end)
+                OR (NgayUpdate BETWEEN win.d_start AND win.d_end))
+            GROUP BY Ngay, MaNV_id
+          ),
+          staff_one AS (
+            SELECT
+              Ngay, MaNV_id,
+              ANY_VALUE(Tenant)   AS Tenant,
+              ANY_VALUE(MaNV)     AS MaNV,
+              ANY_VALUE(group_id) AS group_id
+            FROM (SELECT * FROM staff_from_calls UNION ALL SELECT * FROM staff_from_cus)
+            GROUP BY Ngay, MaNV_id
+          ),
+          staff_enriched AS (
+            SELECT
+              s.Ngay,
+              s.MaNV_id,
+              s.Tenant,
+              s.MaNV,
+              COALESCE(g.name, 'Unassigned') AS Team
+            FROM staff_one s
+            LEFT JOIN `rio-system-migration.dev_callio`.`group` g
+              ON CAST(s.group_id AS STRING) = CAST(g.group_id AS STRING)
+          ),
+
+          -- Status từ PK
+          calls_all AS (
+            SELECT
+              log.NgayTao AS Ngay,
+              CAST(log.fromUser__id AS STRING) AS MaNV_id,
+              log.toNumber AS SDTKhach
+            FROM `rio-system-migration.dev_callio.call_log` log, win
+            WHERE log.tenant = 'PK'                                     -- ✅ PK only
+              AND log.NgayTao BETWEEN win.d_start AND win.d_end
+          ),
+          customers_raw AS (
+            SELECT
+              phone,
+              NULLIF(TRIM(SAFE_CAST(customField_0_val AS STRING)), '') AS customField0_norm
+            FROM `rio-system-migration.dev_callio.customer`, win
+            WHERE tenant = 'PK'                                         -- ✅ PK only
+              AND NgayUpdate BETWEEN win.d_start AND win.d_end
+          ),
+          with_status AS (
+            SELECT
+              c.Ngay,
+              c.MaNV_id,
+              cus.customField0_norm AS TrangThaiXuLi
+            FROM calls_all c
+            LEFT JOIN customers_raw cus
+              ON c.SDTKhach = cus.phone
+          ),
+          status_pivot AS (
+            SELECT
+              Ngay,
+              MaNV_id,
+              SUM(CASE WHEN LOWER(TRIM(TrangThaiXuLi)) LIKE '%zalo%' THEN 1 ELSE 0 END) AS SoSDT_KetBanZalo,
+              SUM(CASE WHEN LOWER(TRIM(TrangThaiXuLi)) IN ('có nhu cầu','co nhu cau')
+                        OR REGEXP_CONTAINS(LOWER(TRIM(TrangThaiXuLi)), r'không đủ điều kiện|khong du dieu kien|suy nghĩ thêm|suy nghi them')
+                  THEN 1 ELSE 0 END) AS SoSDT_CoNhuCau,
+              SUM(CASE WHEN REGEXP_CONTAINS(LOWER(TRIM(TrangThaiXuLi)),
+                        r'không nhu cầu|khong nhu cau|không có nhu cầu|khong co nhu cau|khách chửi nhân viên|khach chui nhan vien|tắt máy ngang|tat may ngang|khách không tương tác|khach khong tuong tac|đã có thẻ|da co the')
+                  THEN 1 ELSE 0 END) AS SoSDT_TuChoi,
+              SUM(CASE WHEN REGEXP_CONTAINS(LOWER(TRIM(TrangThaiXuLi)),
+                        r'máy không nghe được|may khong nghe duoc|không nghe máy|khong nghe may|thuê bao|thue bao')
+                        OR LOWER(TRIM(TrangThaiXuLi)) IN ('bận','ban')
+                  THEN 1 ELSE 0 END) AS SoSDT_KhongNgheMay
+            FROM with_status
+            GROUP BY Ngay, MaNV_id
+          ),
+
+          S AS (
+            SELECT
+              p.Ngay,
+              'PK'               AS Tenant,
+              e.Team,
+              p.MaNV_id,
+              e.MaNV,
+              p.SoSDT_KetBanZalo,
+              p.SoSDT_CoNhuCau,
+              p.SoSDT_TuChoi,
+              p.SoSDT_KhongNgheMay
+            FROM status_pivot p
+            LEFT JOIN staff_enriched e
+              ON p.Ngay = e.Ngay AND p.MaNV_id = e.MaNV_id
+          )
+          SELECT * FROM S
+        ) AS S
+        ON  T.Ngay    = S.Ngay
+        AND T.MaNV_id = S.MaNV_id
+        AND T.Ngay BETWEEN DATE_SUB(CURRENT_DATE('Asia/Ho_Chi_Minh'), INTERVAL 7 DAY)
+                       AND CURRENT_DATE('Asia/Ho_Chi_Minh')
+
+        WHEN MATCHED THEN UPDATE SET
+          T.Tenant               = 'PK',
+          T.Team                 = IFNULL(T.Team, S.Team),
+          T.MaNV                 = IFNULL(T.MaNV, S.MaNV),
+          T.SoSDT_KetBanZalo     = S.SoSDT_KetBanZalo,
+          T.SoSDT_CoNhuCau       = S.SoSDT_CoNhuCau,
+          T.SoSDT_TuChoi         = S.SoSDT_TuChoi,
+          T.SoSDT_KhongNgheMay   = S.SoSDT_KhongNgheMay
+
+        WHEN NOT MATCHED THEN INSERT (
+          Ngay, Tenant, Team, MaNV_id, MaNV,
+          SoSDT_KetBanZalo, SoSDT_CoNhuCau, SoSDT_TuChoi, SoSDT_KhongNgheMay
+        ) VALUES (
+          S.Ngay, 'PK', S.Team, S.MaNV_id, S.MaNV,
+          S.SoSDT_KetBanZalo, S.SoSDT_CoNhuCau, S.SoSDT_TuChoi, S.SoSDT_KhongNgheMay
+        );
+        """
+        self.bq.execute_query(sql)
+        self.logger.info("Reporting refresh for fact_staff_daily_PK completed")
+
     def plan_initial_windows(
         self,
         now: datetime,
@@ -615,17 +917,28 @@ class CallioETLRunner:
         staff_schedule = (self.config.scheduler.staff_group_time_utc,)
         staff_label = self._format_times(staff_schedule)
 
+        ran_any_job = False
+
         if loop_start >= next_customer:
             self._run_customer_all_tenants(schedule_label)
             next_customer = self._next_scheduled(loop_start, schedule)
+            ran_any_job = True
 
         if loop_start >= next_call:
             self._run_call_all_tenants(schedule_label)
             next_call = self._next_scheduled(loop_start, schedule)
+            ran_any_job = True
 
         if loop_start >= next_staffgrp:
             self._run_staff_group_snapshot(staff_label)
             next_staffgrp = self._next_scheduled(loop_start + timedelta(seconds=1), staff_schedule)
+            ran_any_job = True
+
+        if ran_any_job:
+            try:
+                self.run_fact_staff_daily_pk_refresh()
+            except Exception:
+                self.logger.exception("Reporting refresh failed for fact_staff_daily_PK")
 
         self.log_buffer.flush()
         return next_customer, next_call, next_staffgrp
@@ -672,12 +985,15 @@ class CallioETLRunner:
         staff_label = self._format_times(staff_schedule)
 
         jobs = {job} if job != "all" else {"customer", "call", "staffgroup"}
+        ran_any_job = False
 
         if "customer" in jobs:
             self._run_customer_all_tenants(schedule_label)
+            ran_any_job = True
 
         if "call" in jobs:
             self._run_call_all_tenants(schedule_label)
+            ran_any_job = True
 
         if "staffgroup" in jobs:
             current_slot = self._previous_or_current_scheduled(now, staff_schedule)
@@ -695,5 +1011,12 @@ class CallioETLRunner:
                 )
             else:
                 self._run_staff_group_snapshot(staff_label)
+                ran_any_job = True
+
+        if ran_any_job:
+            try:
+                self.run_fact_staff_daily_pk_refresh()
+            except Exception:
+                self.logger.exception("Reporting refresh failed for fact_staff_daily_PK")
 
         self.log_buffer.flush()
