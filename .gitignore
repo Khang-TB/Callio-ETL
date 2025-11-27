@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+
+# Local secrets / env
+.env
+service-account.json
